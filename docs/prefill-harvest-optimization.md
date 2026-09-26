@@ -10,6 +10,7 @@
 | **Reference (read-only)** | `/home/leye/kvmem_qw3` |
 | **Audience** | Engineers implementing Stage 0/1 without re-deriving the diagnosis |
 | **Superseded as roadmap** | 2026-09-06: harvest thread + RAM mean-K landed; 128k `retr_ms` still ~229 s. **Next work is `docs/retrieval-stagein-optimization.md`.** Do not implement further harvest PRs from this file. |
+| **Rev 5 (2026-09-26), 1.A revised** | The host wait on `compute_done` at the end of the harvest is gone. `src/adapter/llama-memory-kvmem.cpp` now orders `cudaStreamPerThread` on the graph event instead (`cudaStreamWaitEvent`). The "N+1 `set_input` race" the fence was written for does not exist: graph inputs are assigned to the CPU backend (`ggml/src/ggml-backend.cpp:945`, `backend_cpu` is appended last in `src/llama-context.cpp`), so `llm_graph_result::set_inputs` is a host memcpy, and `ggml_backend_sched_compute_splits` already host-waits the previous split's event before copying those inputs to the GPU (`ggml-backend.cpp:1677-1684`). What still needs ordering is KVMem's own stage-in / stage-out / meank writes, all on `cudaStreamPerThread` (`src/adapter/llama-kvmem-stagein.cu:100`) - the device wait covers them without parking the compute thread. Measured, 24k prompt: 766 -> 800 tok/s, i.e. -6.9% -> -2.8% vs `--no-kvmem`. `KVMEM_HARVEST_TAIL_SYNC=1` restores the old host wait. **Key Decisions 3, section 1.A, its "Fence protocol", and the `set_input` P0 row below are superseded by this.** |
 
 Testing is paused. Do not relaunch `llama-kvmem-server`, do not refill 256k, do not restart qw3. Harvest Stage 1 in this file is landed; new work follows `docs/retrieval-stagein-optimization.md`.
 
@@ -182,9 +183,9 @@ CUDA `get_tensor` copies on **`cudaStreamPerThread`** and syncs **that** stream 
 
 2. **Stage 1 is KVMem-local harvest overlap, not engine fusion.** Highest ROI that still respects FA freeze and adapter isolation.
 
-3. **Split the barrier. Do not delete all host sync.**
+3. **Split the barrier. Do not delete all host sync.** *(Rev 5: the host wait below was replaced by a device-side wait; see the Rev 5 row at the top.)*
    1. Harvest stream: `cudaStreamWaitEvent(harvest, compute_done)` then D2D → staging (no host wait for D2D/D2H).
-   2. Compute thread: **host-wait `compute_done` (or keep `ggml_backend_synchronize`) before `harvest_pending` returns**, so N+1 `set_input` (`cudaStreamPerThread`) cannot race graph N.
+   2. Compute thread: **host-wait `compute_done` (or keep `ggml_backend_synchronize`) before `harvest_pending` returns**, so N+1 `set_input` (`cudaStreamPerThread`) cannot race graph N. *(Rev 5: not needed - graph inputs are CPU tensors and the scheduler orders their GPU copies itself; KVMem's own PerThread writes are ordered by `cudaStreamWaitEvent(cudaStreamPerThread, compute_done)`.)*
    3. Compute stream: wait on **snap recorded on the harvest stream** so N+1 cannot overwrite capture until D2D completes; D2H stays async and overlaps N+1.
    **Never** `ggml_backend_event_record(snap_be, be)`: that records on the compute stream, which never ran the D2D, so the wait is a no-op. The NVMe-off-thread work (not the graph fence) is what can close a RAM-vs-NVMe tax.
 
@@ -216,7 +217,7 @@ flowchart LR
     G["graph_compute_async ubatch N"]
     Rec["ggml_backend_event_record compute_done"]
     Sub["d2h_submit: harvest waits compute_done; D2D; snap on harvest stream"]
-    Host["HOST-WAIT compute_done before harvest returns"]
+    Host["HOST-WAIT compute_done before harvest returns (rev 5: replaced by a device wait on cudaStreamPerThread)"]
     Commit["PR 1: inline d2h_commit of other slot"]
     StageOut["stage_out: harvest_gpu_v / MTP on_stage_out write_layer_tokens enqueue V; NO wait_writes"]
     G2["set_input N+1 then graph N+1"]
@@ -278,7 +279,7 @@ Concrete costs per 512-token ubatch on this 27B IQ3_S setup:
 | Step | Where | Approx volume |
 |---|---|---|
 | Graph | 4087 ggml nodes, splits=2 | compute |
-| `ggml_backend_synchronize` | host waits for whole graph | **required for set_input**; keep as host-wait `compute_done` |
+| `ggml_backend_synchronize` | host waits for whole graph | **required for set_input**; keep as host-wait `compute_done` *(rev 5: not required; inputs are CPU tensors and the sched orders their copies)* |
 | D2D + `cudaEventSynchronize(snap)` | 16 layers × 512 × 1024 × 2 B = **16 MiB** | host wait of snap is the extra bubble PR 1 can drop |
 | D2H | 16 MiB to pinned | can overlap next graph today after snap wait |
 | `bytes_to_f32_token_major` | 16 MiB F16 → 32 MiB F32 | compute thread |
@@ -415,13 +416,13 @@ Do not relaunch the 256k server for Stage 0.
 
 PR 1 **cannot** drop inline `d2h_commit`. Land PR 1+MTP fence together. PR 3 is the tok/s PR.
 
-#### 1.A Compute fence (host-wait graph; stream-order D2D/D2H)
+#### 1.A Compute fence (host-wait graph; stream-order D2D/D2H) *(rev 5: adopted with a device wait instead of the host wait; see the Rev 5 row at the top)*
 
 **In-scope files.** `src/adapter/llama-memory-kvmem.cpp`, `.h`; `src/adapter/llama-memory-kvmem-mtp.cpp`, `.h`; small shared helper (new `.h/.cpp` under `src/adapter/` or methods on a shared `CaptureD2hPipe` type); `llama.cpp/src/CMakeLists.txt` PRIVATE include of `../ggml/src` so the adapter can include `ggml-backend-impl.h`.
 
 **Do not change.** `llama.cpp/src/llama-graph.cpp` capture. `process_ubatch` hook stays `llama_kvmem_harvest_ubatch`. Do **not** patch `set_input` onto the compute stream.
 
-**Fence protocol (implement exactly this).**
+**Fence protocol (implement exactly this).** *(rev 5: steps 1-6 as written; step 7 replaced by `cudaStreamWaitEvent(cudaStreamPerThread, compute_done)`)*
 
 `CaptureD2hPipe` today:
 
@@ -466,6 +467,8 @@ d2h_->next = 1 - d2h_->next;
 
 // 7) HOST-WAIT graph N before harvest returns. This is the set_input barrier.
 //    Do not skip. D2H may still be in flight; that is OK (reads staging).
+//    Rev 5: replaced by cudaStreamWaitEvent(cudaStreamPerThread, compute_done);
+//    the set_input barrier is already provided by ggml_backend_sched_compute_splits.
 ggml_backend_event_synchronize(d2h_->compute_done);
 ```
 
@@ -879,7 +882,7 @@ Rollback: env then git revert. NVMe arenas are ephemeral; no data migration.
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| N+1 `set_input` (`cudaStreamPerThread`) races graph N if harvest returns without host-waiting `compute_done` | **P0** | Host-wait `compute_done` (or `ggml_backend_synchronize`) before `harvest_pending` returns. Do not delete all host sync. |
+| N+1 `set_input` (`cudaStreamPerThread`) races graph N if harvest returns without host-waiting `compute_done` | ~~**P0**~~ **retracted (rev 5)** | Not a race: graph inputs are CPU tensors (`ggml-backend.cpp:945`) and `ggml_backend_sched_compute_splits` host-waits the previous split before copying them to the GPU (`ggml-backend.cpp:1677-1684`). KVMem's own PerThread writes are ordered by `cudaStreamWaitEvent(cudaStreamPerThread, compute_done)`. |
 | Capture tensor overwrite if graph N+1 runs before D2D of N | **P0** | Snap recorded on **harvest** stream; compute stream waits on that event. Staging is the only D2H source. Identity + `dump_kv_compare` |
 | `ggml_backend_event_record(snap, be)` records on the compute stream (D2D never ran there) | **P0** | `cudaEventRecord(..., d2h_->stream)` only. Handle `event_new == nullptr`. |
 | Q not reduced before pin reuse | **P0** | Reduce `q_sum_` on the `q_sum_` owner thread before marking the slot free |

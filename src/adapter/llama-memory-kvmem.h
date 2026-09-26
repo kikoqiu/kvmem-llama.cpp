@@ -320,6 +320,19 @@ private:
         uint64_t last_nvme_syscalls = 0;
         uint32_t n_pressure = 0;
         uint32_t n_pressure_out = 0;
+        // phase split of one harvest entry: pre + slot_wait + d2h_submit + post == harvest_entry_us
+        int64_t slot_wait_us = 0;
+        int64_t tail_sync_us = 0;
+        int64_t last_pre_us = 0;
+        int64_t last_slot_wait_us = 0;
+        int64_t last_alloc_us = 0;
+        int64_t last_d2h_us = 0;
+        int64_t last_event_us = 0;
+        int64_t last_tail_sync_us = 0;
+        int64_t last_post_us = 0;
+        uint64_t last_bytes = 0;
+        uint32_t last_n_dev = 0;
+        uint32_t last_n_host = 0;
     };
 
     struct RetrPerf {

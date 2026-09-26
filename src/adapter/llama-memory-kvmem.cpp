@@ -226,6 +226,19 @@ static bool kvmem_harvest_sync_old() {
     return e && e[0] != '\0' && e[0] != '0';
 }
 
+// Host-wait for the graph at the end of the harvest. Parks the compute thread
+// until the graph drains, so the next ubatch cannot be prepared meanwhile and
+// the GPU idles for that whole window. Default is the device-side order in
+// d2h_submit. Set to 1 to get the old host wait back.
+static bool kvmem_harvest_tail_sync() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("KVMEM_HARVEST_TAIL_SYNC");
+        v = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+    }
+    return v == 1;
+}
+
 static cudaEvent_t kvmem_ggml_cuda_event(ggml_backend_event_t ev) {
     return ev ? static_cast<cudaEvent_t>(ev->context) : nullptr;
 }
@@ -1838,6 +1851,7 @@ void llama_memory_kvmem::harvest_perf_print_sum() {
     }
     fprintf(stderr, "KVMEM_HARVEST_SUM n_ubatch=%u n_tok=%u "
             "sync_ms=%.3f d2d_ms=%.3f d2h_wait_ms=%.3f pack_ms=%.3f nvme_ms=%.3f "
+            "slot_ms=%.3f tail_ms=%.3f "
             "nvme_bytes=%llu nvme_syscalls=%llu "
             "n_pressure=%u n_pressure_out=%u "
             "mtp_n_ubatch=%u mtp_sync_ms=%.3f mtp_nvme_bytes=%llu mtp_nvme_syscalls=%llu\n",
@@ -1845,6 +1859,7 @@ void llama_memory_kvmem::harvest_perf_print_sum() {
             perf_.sync_us / 1000.0, perf_.d2d_us / 1000.0,
             perf_.d2h_wait_us / 1000.0, perf_.pack_us / 1000.0,
             perf_.nvme_us / 1000.0,
+            perf_.slot_wait_us / 1000.0, perf_.tail_sync_us / 1000.0,
             (unsigned long long) perf_.nvme_bytes,
             (unsigned long long) perf_.nvme_syscalls,
             perf_.n_pressure, perf_.n_pressure_out,
@@ -1866,6 +1881,7 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     if (bytes == 0) {
         return false;
     }
+    const int64_t t_slot_wait = ggml_time_us();
     auto & s = d2h_->slots[d2h_->next];
     if (s.inflight) {
         if (harvest_worker_on()) {
@@ -1877,10 +1893,16 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
             d2h_commit(d2h_->next);
         }
     }
+    perf_.last_slot_wait_us = ggml_time_us() - t_slot_wait;
+    perf_.slot_wait_us += perf_.last_slot_wait_us;
     perf_.last_sync_us = 0;
     perf_.last_d2d_us = 0;
     perf_.last_snap_wait_us = 0;
     perf_.last_d2h_submit_us = 0;
+    perf_.last_alloc_us = 0;
+    perf_.last_d2h_us = 0;
+    perf_.last_event_us = 0;
+    perf_.last_tail_sync_us = 0;
     const int64_t t_submit0 = ggml_time_us();
     if (s.cap < bytes) {
         if (s.gpu) {
@@ -1907,6 +1929,7 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
             d2h_->snap_be = ggml_backend_event_new(dev);
         }
     }
+    perf_.last_alloc_us = ggml_time_us() - t_submit0;
     const bool old_sync = kvmem_harvest_sync_old() || !be || !d2h_->compute_done ||
             !kvmem_ggml_cuda_event(d2h_->compute_done);
     {
@@ -1978,6 +2001,9 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     }
     perf_.last_d2d_us = ggml_time_us() - t_d2d;
     perf_.d2d_us += perf_.last_d2d_us;
+    perf_.last_bytes = off;
+    perf_.last_n_dev = n_dev;
+    perf_.last_n_host = n_host;
     if (n_dev > 0) {
         if (!kvmem_cuda_ok(cudaEventRecord(d2h_->snap, d2h_->stream), "snap record")) {
             return false;
@@ -1996,6 +2022,7 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
         }
         perf_.last_snap_wait_us = ggml_time_us() - t_snap;
         perf_.snap_wait_us += perf_.last_snap_wait_us;
+        const int64_t t_d2h = ggml_time_us();
         if (n_host == 0) {
             if (!kvmem_cuda_ok(kvmem_copy_async(s.pin, s.gpu, off, cudaMemcpyDeviceToHost, d2h_->stream),
                                "D2H")) {
@@ -2013,7 +2040,9 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
                 }
             }
         }
+        perf_.last_d2h_us = ggml_time_us() - t_d2h;
     }
+    const int64_t t_post = ggml_time_us();
     if (!kvmem_cuda_ok(cudaEventRecord(s.done, d2h_->stream), "record")) {
         return false;
     }
@@ -2028,8 +2057,22 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     } else {
         s.inflight = true;
     }
+    perf_.last_event_us = ggml_time_us() - t_post;
     if (!old_sync && d2h_->compute_done) {
-        ggml_backend_event_synchronize(d2h_->compute_done);
+        if (kvmem_harvest_tail_sync()) {
+            const int64_t t_tail = ggml_time_us();
+            ggml_backend_event_synchronize(d2h_->compute_done);
+            perf_.last_tail_sync_us = ggml_time_us() - t_tail;
+            perf_.tail_sync_us += perf_.last_tail_sync_us;
+        } else if (cudaEvent_t cde = kvmem_ggml_cuda_event(d2h_->compute_done)) {
+            // Same order as the host wait, without the stall: the graph inputs are
+            // on the CPU backend, so the scheduler already waits for the previous
+            // split before it copies them to the GPU. What is left are KVMem's own
+            // host writes (stage-in, eviction), which run on cudaStreamPerThread.
+            if (!kvmem_cuda_ok(cudaStreamWaitEvent(cudaStreamPerThread, cde, 0), "tail order")) {
+                ggml_backend_event_synchronize(d2h_->compute_done);
+            }
+        }
     }
     perf_.last_d2h_submit_us = ggml_time_us() - t_submit0;
     perf_.d2h_submit_us += perf_.last_d2h_submit_us;
@@ -2057,6 +2100,13 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
     perf_.last_d2d_us = 0;
     perf_.last_snap_wait_us = 0;
     perf_.last_d2h_submit_us = 0;
+    perf_.last_pre_us = 0;
+    perf_.last_slot_wait_us = 0;
+    perf_.last_alloc_us = 0;
+    perf_.last_d2h_us = 0;
+    perf_.last_event_us = 0;
+    perf_.last_tail_sync_us = 0;
+    perf_.last_post_us = 0;
     if (d2h_ && d2h_->ok && !harvest_worker_on()) {
         d2h_commit(d2h_->next == 0 ? 1 : 0);
     }
@@ -2080,6 +2130,7 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
         }
     }
     const uint32_t n_pos = pos_queue_.empty() ? 0u : (uint32_t) pos_queue_.front().size();
+    perf_.last_pre_us = ggml_time_us() - t_entry;
     bool submitted = d2h_submit(be);
     if (!submitted) {
         cur_pos_ = std::move(pos_queue_.front());
@@ -2091,24 +2142,38 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
             ggml_backend_sched_synchronize(sched);
         }
     }
+    const int64_t t_post = ggml_time_us();
     harvest_full_blocks_async();
+    perf_.last_post_us = ggml_time_us() - t_post;
     const int64_t entry_us = ggml_time_us() - t_entry;
     perf_.harvest_entry_us += entry_us;
     perf_.n_ubatch += 1;
     perf_.n_tok += n_pos;
     if (perf_.enabled) {
         fprintf(stderr, "KVMEM_HARVEST ubatch=%u n=%u is_mtp=0 "
-                "harvest_entry_us=%lld sync_us=%lld d2d_us=%lld snap_wait_us=%lld "
-                "d2h_submit_us=%lld commit_us=%lld pack_us=%lld "
+                "bytes=%llu n_dev=%u n_host=%u "
+                "harvest_entry_us=%lld pre_us=%lld slot_wait_us=%lld d2h_submit_us=%lld "
+                "alloc_us=%lld sync_us=%lld d2d_us=%lld snap_wait_us=%lld "
+                "d2h_us=%lld event_us=%lld tail_sync_us=%lld "
+                "commit_us=%lld pack_us=%lld post_us=%lld "
                 "nvme_us=%lld nvme_bytes=%llu nvme_syscalls=%llu\n",
                 perf_.n_ubatch, n_pos,
+                (unsigned long long) perf_.last_bytes,
+                perf_.last_n_dev, perf_.last_n_host,
                 (long long) entry_us,
+                (long long) perf_.last_pre_us,
+                (long long) perf_.last_slot_wait_us,
+                (long long) perf_.last_d2h_submit_us,
+                (long long) perf_.last_alloc_us,
                 (long long) perf_.last_sync_us,
                 (long long) perf_.last_d2d_us,
                 (long long) perf_.last_snap_wait_us,
-                (long long) perf_.last_d2h_submit_us,
+                (long long) perf_.last_d2h_us,
+                (long long) perf_.last_event_us,
+                (long long) perf_.last_tail_sync_us,
                 (long long) perf_.last_commit_us,
                 (long long) perf_.last_pack_us,
+                (long long) perf_.last_post_us,
                 (long long) perf_.last_nvme_us,
                 (unsigned long long) perf_.last_nvme_bytes,
                 (unsigned long long) perf_.last_nvme_syscalls);

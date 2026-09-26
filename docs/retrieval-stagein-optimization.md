@@ -98,7 +98,7 @@ NVMe flush happens **after** `harvest_gpu_v` has already D2H’d. It drops RSS; 
 
 - Do not patch `ggml_flash_attn_ext` / FlashInfer / NVFP4 / GDN port.
 - Do not switch Q/K to compact window coordinates.
-- Do not remove harvest’s host-wait of `compute_done` (N+1 `set_input` race).
+- ~~Do not remove harvest’s host-wait of `compute_done` (N+1 `set_input` race).~~ **Revised 2026-09-26 (llama.cpp-kvmem tree):** the host wait is removed; `d2h_submit` orders `cudaStreamPerThread` on the graph event instead (`cudaStreamWaitEvent`). There is no N+1 `set_input` race: graph inputs live on the CPU backend (`ggml/src/ggml-backend.cpp:945`) and `ggml_backend_sched_compute_splits` already host-waits the previous split before copying them to the GPU (`ggml-backend.cpp:1677-1684`). The device wait covers KVMem’s own PerThread writes (stage-in/out, meank). Prefill 24k: 766 -> 800 tok/s (-6.9% -> -2.8% vs `--no-kvmem`). `KVMEM_HARVEST_TAIL_SYNC=1` restores the old wait.
 - Do not move `set_input` onto the compute stream.
 - Do not promise kvmem prefill → stock 738 tok/s.
 - Do not retest IQ3 MTP. Do not restart qw3.
