@@ -275,9 +275,13 @@ private:
                                          int64_t d, int64_t h, int64_t n,
                                          size_t nb0, size_t nb1, size_t nb2,
                                          std::vector<uint16_t> & out);
+    // The commit drops every Q row outside the query / prefill spans, so only the
+    // window that holds those rows is staged. False = no row to drop.
+    bool q_window_rows(const struct ggml_tensor * t, const std::vector<llama_pos> & pos,
+                       int64_t * row0, int64_t * row1) const;
     void harvest_from_host(int il, char which, const uint8_t * host,
                            ggml_type type, int64_t d, int64_t h, int64_t n,
-                           size_t nb0, size_t nb1, size_t nb2);
+                           int64_t row0, size_t nb0, size_t nb1, size_t nb2);
     bool d2h_init();
     void d2h_free();
     void d2h_commit(int slot);
@@ -312,6 +316,7 @@ private:
         int64_t nvme_us = 0;
         uint64_t nvme_bytes = 0;
         uint64_t nvme_syscalls = 0;
+        uint64_t q_rows = 0;
         int64_t last_sync_us = 0;
         int64_t last_d2d_us = 0;
         int64_t last_snap_wait_us = 0;

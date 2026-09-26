@@ -157,6 +157,7 @@ struct llama_memory_kvmem::CaptureD2hPipe {
         char which = 0;
         size_t offset = 0;
         size_t nbytes = 0;
+        int64_t row0 = 0; // first copied row; Q items stage only the span window
         int64_t d = 0;
         int64_t h = 0;
         int64_t n = 0;
@@ -1745,13 +1746,13 @@ void llama_memory_kvmem::d2h_commit(int slot) {
     for (const auto & it : s.items) {
         if (it.which == 'q') {
             harvest_from_host(it.il, it.which, s.pin + it.offset, it.type,
-                              it.d, it.h, it.n, it.nb0, it.nb1, it.nb2);
+                              it.d, it.h, it.n, it.row0, it.nb0, it.nb1, it.nb2);
         }
     }
     for (const auto & it : s.items) {
         if (it.which != 'q') {
             harvest_from_host(it.il, it.which, s.pin + it.offset, it.type,
-                              it.d, it.h, it.n, it.nb0, it.nb1, it.nb2);
+                              it.d, it.h, it.n, it.row0, it.nb0, it.nb1, it.nb2);
         }
     }
     const int64_t pack_wall_us = ggml_time_us() - tp;
@@ -1830,6 +1831,7 @@ void llama_memory_kvmem::harvest_perf_print_sum() {
             "slot_ms=%.3f tail_ms=%.3f "
             "nvme_bytes=%llu nvme_syscalls=%llu "
             "n_pressure=%u n_pressure_out=%u "
+            "q_rows=%llu "
             "mtp_n_ubatch=%u mtp_sync_ms=%.3f mtp_nvme_bytes=%llu mtp_nvme_syscalls=%llu\n",
             perf_.n_ubatch, perf_.n_tok,
             perf_.sync_us / 1000.0, perf_.d2d_us / 1000.0,
@@ -1839,6 +1841,7 @@ void llama_memory_kvmem::harvest_perf_print_sum() {
             (unsigned long long) perf_.nvme_bytes,
             (unsigned long long) perf_.nvme_syscalls,
             perf_.n_pressure, perf_.n_pressure_out,
+            (unsigned long long) perf_.q_rows,
             mtp_n, mtp_sync_us / 1000.0,
             (unsigned long long) mtp_nvme_bytes,
             (unsigned long long) mtp_nvme_syscalls);
@@ -1959,9 +1962,21 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     if (!d2h_init() || pending_capture_.empty() || pos_queue_.empty()) {
         return false;
     }
+    // Q rows outside the query / prefill spans die at commit, so stage only the
+    // window that holds them: the slot stays sized by the K payload.
+    std::vector<std::pair<int64_t, int64_t>> q_win(pending_capture_.size(), {-1, -1});
     size_t bytes = 0;
-    for (const CaptureNode & n : pending_capture_) {
-        if (n.t && n.which != 'v') {
+    for (size_t i = 0; i < pending_capture_.size(); ++i) {
+        const CaptureNode & n = pending_capture_[i];
+        if (!n.t || n.which == 'v') {
+            continue;
+        }
+        int64_t r0 = 0;
+        int64_t r1 = 0;
+        if (n.which == 'q' && q_window_rows(n.t, pos_queue_.front(), &r0, &r1)) {
+            q_win[i] = {r0, r1};
+            bytes += static_cast<size_t>(r1 - r0) * n.t->nb[2];
+        } else {
             bytes += ggml_nbytes(n.t);
         }
     }
@@ -2029,9 +2044,10 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     s.pos = std::move(pos_queue_.front());
     pos_queue_.erase(pos_queue_.begin());
     size_t off = 0;
-    uint32_t n_q = 0, n_k = 0, n_v = 0, n_host = 0, n_dev = 0;
+    uint32_t n_q = 0, n_k = 0, n_v = 0, n_host = 0, n_dev = 0, n_q_rows = 0;
     const int64_t t_d2d = ggml_time_us();
-    for (const CaptureNode & n : pending_capture_) {
+    for (size_t i = 0; i < pending_capture_.size(); ++i) {
+        const CaptureNode & n = pending_capture_[i];
         if (!n.t || n.which == 'v') {
             continue;
         }
@@ -2039,7 +2055,6 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
         it.il = n.il;
         it.which = n.which;
         it.offset = off;
-        it.nbytes = ggml_nbytes(n.t);
         it.d = n.t->ne[0];
         it.h = n.t->ne[1];
         it.n = n.t->ne[2];
@@ -2047,8 +2062,15 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
         it.nb1 = n.t->nb[1];
         it.nb2 = n.t->nb[2];
         it.type = n.t->type;
-        ggml_backend_buffer_t buf = n.t->view_src ? n.t->view_src->buffer : n.t->buffer;
+        it.nbytes = ggml_nbytes(n.t);
         const uint8_t * src = static_cast<const uint8_t *>(n.t->data);
+        if (q_win[i].first >= 0) {
+            it.row0 = q_win[i].first;
+            it.n = q_win[i].second - q_win[i].first;
+            it.nbytes = static_cast<size_t>(it.n) * it.nb2;
+            src += static_cast<size_t>(it.row0) * it.nb2;
+        }
+        ggml_backend_buffer_t buf = n.t->view_src ? n.t->view_src->buffer : n.t->buffer;
         if (buf && ggml_backend_buffer_is_host(buf)) {
             memcpy(s.pin + off, src, it.nbytes);
             n_host++;
@@ -2064,6 +2086,7 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
         }
         if (n.which == 'q') {
             n_q++;
+            n_q_rows += static_cast<uint32_t>(it.n);
         } else if (n.which == 'k') {
             n_k++;
         } else if (n.which == 'v') {
@@ -2077,6 +2100,7 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     perf_.last_bytes = off;
     perf_.last_n_dev = n_dev;
     perf_.last_n_host = n_host;
+    perf_.q_rows += n_q_rows;
     if (n_dev > 0) {
         if (!kvmem_cuda_ok(cudaEventRecord(d2h_->snap, d2h_->stream), "snap record")) {
             return false;
@@ -2150,8 +2174,8 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     perf_.last_d2h_submit_us = ggml_time_us() - t_submit0;
     perf_.d2h_submit_us += perf_.last_d2h_submit_us;
     if (trace_) {
-        kvmem_diag("KVMEM_TRACE harvest n=%zu q=%u k=%u v=%u host=%u gpu=%u bytes=%zu n_pos=%zu async=1 slot=%d\n",
-                s.items.size(), n_q, n_k, n_v, n_host, n_dev, off, s.pos.size(), submitted);
+        kvmem_diag("KVMEM_TRACE harvest n=%zu q=%u q_rows=%u k=%u v=%u host=%u gpu=%u bytes=%zu n_pos=%zu async=1 slot=%d\n",
+                s.items.size(), n_q, n_q_rows, n_k, n_v, n_host, n_dev, off, s.pos.size(), submitted);
     }
     d2h_->next = 1 - d2h_->next;
     return true;
@@ -2332,9 +2356,45 @@ void llama_memory_kvmem::tensor_to_f32_token_major(const ggml_tensor * t, std::v
                              t->nb[0], t->nb[1], t->nb[2], out);
 }
 
+// The commit keeps only the Q rows inside the query / prefill spans, so the D2D and
+// the staging slot only need the window that holds them. False = stage every row.
+bool llama_memory_kvmem::q_window_rows(const ggml_tensor * t, const std::vector<llama_pos> & pos,
+                                       int64_t * row0, int64_t * row1) const {
+    if (!kvmem_env_flag("KVMEM_Q_WINDOW")) { // 0 = stage every row, for A/B
+        return false;
+    }
+    if (!t || !row0 || !row1 || t->ne[2] <= 1 || static_cast<int64_t>(pos.size()) < t->ne[2]) {
+        return false;
+    }
+    // One row must be one contiguous run, so one window is one copy per layer.
+    if (t->nb[1] != static_cast<size_t>(t->ne[0]) * ggml_type_size(t->type) ||
+        t->nb[2] != static_cast<size_t>(t->ne[1]) * t->nb[1]) {
+        return false;
+    }
+    const bool prefill = has_prefill_query();
+    int64_t first = -1;
+    int64_t last = -1;
+    for (int64_t i = 0; i < t->ne[2]; ++i) {
+        const llama_pos row = pos[i];
+        if (!query_contains(row) && !(prefill && prefill_query_contains(row, nullptr))) {
+            continue;
+        }
+        if (first < 0) {
+            first = i;
+        }
+        last = i;
+    }
+    if (first < 0 || (first == 0 && last == t->ne[2] - 1)) {
+        return false;
+    }
+    *row0 = first;
+    *row1 = last + 1;
+    return true;
+}
+
 void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * host,
                                            ggml_type type, int64_t d, int64_t h, int64_t ntok,
-                                           size_t nb0, size_t nb1, size_t nb2) {
+                                           int64_t row0, size_t nb0, size_t nb1, size_t nb2) {
     if (which == 'v') {
         return;
     }
@@ -2358,14 +2418,20 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
             raw_->write_layer_mean_k(pos0, n, static_cast<uint32_t>(il), flat.data());
         }
     } else if (which == 'q') {
+        // Q is staged as a row window: reduce exactly the rows the window holds.
+        const uint32_t base = static_cast<uint32_t>(row0);
+        const uint32_t rows = static_cast<uint32_t>(ntok);
+        if (rows == 0 || static_cast<uint64_t>(base) + rows > cur_pos_.size()) {
+            return;
+        }
         std::vector<float> flat;
         bytes_to_f32_token_major(host, type, d, h, ntok, nb0, nb1, nb2, flat);
         const uint32_t qdim = n_head_ * n_embd_head_;
-        if (flat.size() < static_cast<size_t>(n) * qdim) {
+        if (flat.size() < static_cast<size_t>(rows) * qdim) {
             return;
         }
-        for (uint32_t i = 0; i < n; ++i) {
-            accumulate_query_row(static_cast<uint32_t>(il), flat.data() + i * qdim, qdim, cur_pos_[i]);
+        for (uint32_t i = 0; i < rows; ++i) {
+            accumulate_query_row(static_cast<uint32_t>(il), flat.data() + i * qdim, qdim, cur_pos_[base + i]);
         }
     }
 }
@@ -3151,6 +3217,9 @@ bool llama_memory_kvmem::query_contains(llama_pos row) const {
 }
 
 void llama_memory_kvmem::set_prefill_query_spans(const std::vector<llama_kvmem_row_range> & spans) {
+    // The Q window is chosen at submit and reduced at commit, so drain the pipe
+    // before the spans move and both see one state.
+    harvest_flush();
     prefill_spans_.clear();
     for (const auto & r : spans) {
         if (r.begin < 0 || r.end < r.begin) {

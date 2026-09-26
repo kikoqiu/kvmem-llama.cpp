@@ -11,6 +11,7 @@
 | **Audience** | Engineers implementing Stage 0/1 without re-deriving the diagnosis |
 | **Superseded as roadmap** | 2026-09-06: harvest thread + RAM mean-K landed; 128k `retr_ms` still ~229 s. **Next work is `docs/retrieval-stagein-optimization.md`.** Do not implement further harvest PRs from this file. |
 | **Rev 5 (2026-09-26), 1.A revised** | The host wait on `compute_done` at the end of the harvest is gone. `src/adapter/llama-memory-kvmem.cpp` now orders `cudaStreamPerThread` on the graph event instead (`cudaStreamWaitEvent`). The "N+1 `set_input` race" the fence was written for does not exist: graph inputs are assigned to the CPU backend (`ggml/src/ggml-backend.cpp:945`, `backend_cpu` is appended last in `src/llama-context.cpp`), so `llm_graph_result::set_inputs` is a host memcpy, and `ggml_backend_sched_compute_splits` already host-waits the previous split's event before copying those inputs to the GPU (`ggml-backend.cpp:1677-1684`). What still needs ordering is KVMem's own stage-in / stage-out / meank writes, all on `cudaStreamPerThread` (`src/adapter/llama-kvmem-stagein.cu:100`) - the device wait covers them without parking the compute thread. Measured, 24k prompt: 766 -> 800 tok/s, i.e. -6.9% -> -2.8% vs `--no-kvmem`. `KVMEM_HARVEST_TAIL_SYNC=1` restores the old host wait. **Key Decisions 3, section 1.A, its "Fence protocol", and the `set_input` P0 row below are superseded by this.** |
+| **Rev 6 (2026-09-27), Stage 5 landed** | Q capture is staged as a row window: `d2h_submit` sizes the pipe slot and copies only the rows `query_contains` / `prefill_query_contains` accept, `CaptureD2hPipe::Item::row0` carries the window start, `harvest_from_host` reduces `cur_pos_[row0 + i]`, and `set_prefill_query_spans` drains the pipe before the spans move (it did not, unlike `set_turn_spans` / `set_query_span`). Adapter only, `KVMEM_Q_WINDOW=0` restores the old full staging, `KVMEM_TRACE harvest` gained `q_rows=` and `KVMEM_HARVEST_SUM` a `q_rows=` total. Builds clean. **The T0/T0s/T1/T2/T5 gates below have not been run yet.** |
 
 Testing is paused. Do not relaunch `llama-kvmem-server`, do not refill 256k, do not restart qw3. Harvest Stage 1 in this file is landed; new work follows `docs/retrieval-stagein-optimization.md`.
 
@@ -708,21 +709,41 @@ Why: product is llama.cpp engine + thin KVMem; FA freeze; months of sm_120 owner
 
 Revisit only if the user explicitly asks after Stage 1–3 numbers.
 
-### Stage 5 - Q capture reduction (planned, not done)
+### Stage 5 - Q capture: stage only the rows the score reads (landed, gates not run)
 
-The largest KVMem temp on the card is the Q half of the capture pipe. The query-span ubatch carries 16 full-length F32 Q tensors; measured 27B IQ3 24k `-ub 1024`: 226 MiB in one staging slot against 64 MiB for the K-only ubatch, and the same 2-slot pipe means around 770 MiB per slot at `-ub 2048`. That is the allocation that fails first when VRAM runs out.
+Implemented in `src/adapter/llama-memory-kvmem.cpp` / `.h`; `KVMEM_Q_WINDOW=0` restores the old behavior. The gates at the end of this section have not been run. Everything else in this file is landed, or superseded by `docs/retrieval-stagein-optimization.md`.
 
-`accumulate_query_row` only needs the sum of the rows that fall in the query / prefill span, so the transfer scales with the ubatch for no reason.
+**Symptom.** The largest KVMem temp on the card is the Q half of the capture pipe. `kvmem_capture_q` (`llama.cpp/src/llama-graph.cpp`) marks one full-length F32 Q tensor per attention layer as a graph output for every ubatch that overlaps a query span, and `d2h_submit` packs K and Q into the same staging slot, so the slot is sized by `ub * (k_row + q_row)` instead of `ub * k_row`. Measured 27B IQ3 24k `-ub 1024`: 226 MiB on the Q-bearing ubatch against 64 MiB on the K-only ubatches, and the same 2-slot pipe means around 770 MiB per slot at `-ub 2048`. That is the allocation that fails first when VRAM runs out: at `-ub 2048` this is the `KVMEM D2H gpu staging: out of memory` line reported in `temp/scratch-cap-plan.md`.
 
-Plan:
+**Waste.** `harvest_from_host` -> `accumulate_query_row` is the only consumer, and it returns early for every row outside `query_contains` and outside a `prefill_query_contains` span. The D2D, the staging bytes, the D2H and the F32 host pack of those rows are dead weight. The rows that matter are bounded by the span widths, not by the ubatch: the request query span (`--kvmem-query-last 64`, or the token path `--kvmem-query-max` up to 512) and one 128-row tail per crossed user span (`--kvmem-prefill-query-max`).
 
-- Device-side span sum, shaped like the existing mean-K kernels (`kvmem_meank_*`), fed with a per-row mask built from `query_contains` / `prefill_query_contains`.
-- The adapter keeps `reset_prefill_acc` semantics for the prefill span; a ubatch that mixes two prefill spans falls back to the current full staging, so the peak stays a worst case instead of the norm.
-- Gate: 24k recipe identity (same `content_sha`), retrieval selection diff = 0, and `KVMEM_CAPTURE_MEMORY` showing the smaller slot.
+**Plan (adapter only, no kernel, no graph change).**
 
-This is not the earlier "reduce on the GPU to save prefill time" idea, which measured ~0.2% and was dropped (`temp/harvest-ubatch-cost-plan.md` section 0.6.3). The objective here is VRAM, where the same reduction gives back 226 MiB to 770 MiB per slot plus the matching D2H traffic.
+- `d2h_submit`: build one row window per Q capture node from the ubatch positions (`pos_queue_.front()`): `row0` = first index whose position is in a span, `row1` = last such index + 1. The sizing pass and the D2D use that window, so the slot never grows to the full-Q high-water mark: D2D offset `row0 * nb2`, bytes `(row1 - row0) * nb2`.
+- `CaptureD2hPipe::Item`: add the window start `row0`; the row count is already `n`. `d2h_commit` passes it on and `harvest_from_host` indexes `cur_pos_[row0 + i]`.
+- Bit-identical by construction: the window is a superset of the rows `accumulate_query_row` accepts, and the host reduces them in row order with the same predicate and the same `reset_prefill_acc` sequence. `set_turn_spans` and `set_query_span` already drain the pipe (`harvest_flush`) before the spans move; `set_prefill_query_spans` does not, so add that drain. The copy happens at submit and the reduce at commit, so without it a late commit could need a row the window dropped. `freeze_query` only narrows the row set, so it stays safe.
+- K/V items keep `row0 = 0` and the full row count: mean-K needs every token. The graph hook, `llama.cpp/src` and the kernels are untouched. MTP registers no Q (`llama-memory-kvmem-mtp.cpp::register_capture`), so MTP is untouched.
+- Fallback, never worse than today: no window when the tensor is not token-major packed (`nb1 != ne[0] * type_size` or `nb2 != ne[1] * nb1`), when no row is in a span, or when the window covers the whole ubatch. `KVMEM_Q_WINDOW=0` stages every row again, so the A/B and the rollback come from one build. `KVMEM_HARVEST_SYNC=1` only changes the sync (worker off, host wait); the untouched full-tensor consumer is `harvest_capture`, taken when `d2h_submit` fails.
 
-Related, landed 2026-09-27: staging only grows, so the pipe now gives idle staging back under pressure (`KVMEM_STAGING_TRIM`, `KVMEM_TEMP_BUDGET_MB`). Details in the temp VRAM section of `retrieval-stagein-optimization.md`.
+Scope: this is not the earlier "reduce on the GPU to save prefill time" idea, which measured ~0.2% and was dropped (`temp/harvest-ubatch-cost-plan.md` section 0.6.3). The win here is VRAM, and it comes from not staging bytes that no one reads.
+
+**Expected.** The slot becomes `n_layer * (ub * k_row + win * q_row) * 4`, where `k_row` and `q_row` are the F32 per-token bytes of the captured K and Q and `win` is the window. A 64-row window on a 1024-row ubatch copies 1/16 of each Q tensor, so the Q share of the slot - and of the D2H and the host pack - falls by that factor and the slot lands near the K-only size. Read the real number off `KVMEM_CAPTURE_MEMORY`; do not predict it.
+
+**Bound, and when to go on device.** A window only pays while the spans crossed by one ubatch are a small part of it. Print the copied Q rows in `KVMEM_TRACE harvest` (`q_rows=` next to the ubatch `n=`) and sum them in `KVMEM_HARVEST_SUM`. If a real prompt keeps `q_rows` near the ubatch size (many user-span tails crossed in one ubatch), then stage the runs as separate ranges, or reduce them on device with a `kvmem_meank_*`-shaped kernel and D2H `qdim` floats per run - the earlier sketch for this stage. Do not write that kernel before the counter says it is needed.
+
+**Gates.**
+
+| Test | Run | Pass |
+|---|---|---|
+| T4 CPU | `raw_kv_store_test` (with the other store tests) | unchanged; no new test file |
+| T0 / T0s | 0.8B identity canary; again with `KVMEM_HARVEST_SYNC=1` and with `KVMEM_Q_WINDOW=0` | tokens == `--no-kvmem` in all three runs |
+| T1 | recency needle | still misses BLUEBIRD-42 |
+| T2 | retrieval needle `--no-think` | BLUEBIRD-42 GO/NO-GO; `KVMEM_TRACE` selection lines (time fields normalized) diff = 0 and `KVMEM_RETR_SUM` counters equal |
+| T5 | 24k 27B IQ3 `-ub 1024`, then `-ub 2048`, `KVMEM_PERF=1 KVMEM_TRACE=1` | no crash; the Q ubatch `bytes=` == K payload + windowed Q; `KVMEM_CAPTURE_MEMORY` shows the slot below 226 MiB / ~770 MiB, and the same run with `KVMEM_Q_WINDOW=0` shows the old slot; prompt tok/s not worse |
+
+**Rollback.** `KVMEM_Q_WINDOW=0` (same build, A/B), or a revert: the change is adapter-only, with no on-disk format and no KV state change.
+
+Related, landed 2026-09-27: staging only grows, so the pipe now gives idle staging back under pressure (`KVMEM_STAGING_TRIM`, `KVMEM_TEMP_BUDGET_MB`). Details in the temp VRAM section of `retrieval-stagein-optimization.md`. After Stage 5 the pipe is sized by the K payload, so that trim matters less.
 
 
 ---
@@ -735,6 +756,7 @@ No public HTTP flag changes required for Stage 0/1 except documented env vars.
 |---|---|
 | `KVMEM_PERF=1` | Harvest timers + `KVMEM_HARVEST_SUM` from `harvest_flush` + `KVMEM_CUDA_GRAPH`. Does not dump retrieval lists. |
 | `KVMEM_HARVEST_SYNC=1` | Restore **pre-Stage-1 functions** (old `d2h_submit`, MTP `ggml_backend_tensor_get`, inline `write_block`, **worker off**). T0 each PR. Delete after M2. |
+| `KVMEM_Q_WINDOW` | Stage 5. Default on; `0` = stage every Q row (pre-Stage-5 behavior) for A/B from one build. |
 | `RawKvStore::write_layer_tokens_f16` | New. F32 `write_layer_tokens` remains (V stage-out). |
 | `RawKvStore::wait_writes()` | New. Drain IO thread. **Only** `harvest_flush`, before `score_retrieval` / `follow_retrieval`, and `~RawKvStore`. **Not** `harvest_gpu_v` / `on_stage_out` / `apply_plan_to_kv`. `copy_k` of a flushing block waits that job. |
 | `llama_memory_kvmem_mtp::harvest_flush()` | New. Trunk `apply_retrieval` must call it. |
@@ -780,6 +802,7 @@ Mean-K remains RAM-resident for retrieval scoring (`score_retrieval` → `raw_->
 | 2 | `tools/llama-kvmem-cli.cpp`, `tools/llama-kvmem-server.cpp`, `README.md` (27B recipe: server `-b 2048` or CLI `-b 2048 -ub 2048`) |
 | 3 | Measurement notes. **No** `ggml-cuda/fattn*.cu` |
 | 4 | None |
+| 5 | `src/adapter/llama-memory-kvmem.cpp/.h` (Q row window in `d2h_submit` / `d2h_commit`). No llama.cpp, no kernel. |
 
 `patches/0002-attn-qk-capture-hook.patch` should not grow. Capture is already correct.
 
