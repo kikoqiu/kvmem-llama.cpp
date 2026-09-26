@@ -7,7 +7,10 @@
 #include <vector>
 
 // A single gate covers API routes before JSON parsing or slot acquisition.
-// Only health checks, preflights and the mounted UI's exact asset paths are public.
+// Only health checks, preflights and the public page assets are exempt: the
+// mounted UI's exact paths plus the swap-status page HTML that the server adds
+// when --kvmem-swap-ui is on. That page carries no model data; its data routes
+// stay behind the key.
 inline void kvmem_install_auth(httplib::Server & server, std::vector<std::string> keys,
                                 std::unordered_set<std::string> ui_paths) {
     server.set_pre_routing_handler([keys = std::move(keys), ui_paths = std::move(ui_paths)](

@@ -129,6 +129,35 @@ Then start the rebuilt server with the usual IQ3/IQ4 script and open `http://127
 
 Chat histories stay in this browser. Switching histories can require recomputing an uncached prompt; normal continuation reuses the existing KV cache. Closing or reloading the page interrupts generation; stream resumption is not included.
 
+`--kvmem-swap-ui` adds a separate KV-swap diagnostic page on the same port; see [Swap status page](#swap-status-page).
+
+## Swap status page
+
+`--kvmem-swap-ui` (or `LLAMA_ARG_KVMEM_SWAP_UI=1`) serves a diagnostic page at
+`/kvmem/swap` on the same port. It is off by default, needs nothing at build
+time, and also works with `--no-ui`.
+
+Each pixel is one KV block: green is GPU-resident, red is swapped out to the
+host side, purple is the NVMe tier and amber means an asynchronous copy owns the
+block. Hovering outlines the pixel and adds its index, position and tier to the
+status line; clicking a pixel shows that block's index, original position range,
+tier and slot numbers, working-set/in-flight flags, remap count and the original
+token text.
+
+| Route | Purpose |
+| --- | --- |
+| `GET /kvmem/swap` | The page itself, with a link back to the chat UI |
+| `GET /kvmem/swap/status` | Pool counters plus one compact row per block |
+| `GET /kvmem/swap/block?id=N` | One block, including its token ids and text |
+
+The page polls `/kvmem/swap/status` once per second (`?interval=250..60000`) and
+`/kvmem/swap/block` on click. The model thread publishes the snapshots, so
+polling never waits for inference and `age_ms` reports how old a snapshot is.
+Token text is available for blocks whose positions the server still holds, which
+in practice means after the first request completes. With `--api-key`, open the
+page as `/kvmem/swap?key=sk-xxx`: the page markup is public, while the two data
+routes require the key like `/props` and `/slots`.
+
 ## llama-server CLI compatibility
 
 The rc3 version of `llama-kvmem-server` accepts the common flags below with
@@ -218,7 +247,7 @@ A CLI key does not revoke an environment key.
 | `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_CACHE_TYPE_K`, `LLAMA_ARG_CACHE_TYPE_V`, `LLAMA_ARG_N_PARALLEL` | Attention, KV types and single-slot configuration |
 | `LLAMA_ARG_LOAD_MODE`, `LLAMA_ARG_MMAP`, `LLAMA_ARG_MLOCK` | Model loading; legacy environment options apply before `LOAD_MODE` |
 | `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_OFFLOAD`, `LLAMA_ARG_IMAGE_MIN_TOKENS`, `LLAMA_ARG_IMAGE_MAX_TOKENS` | Vision |
-| `LLAMA_ARG_UI`, `LLAMA_ARG_STATIC_PATH` | UI enabled/disabled and static directory |
+| `LLAMA_ARG_UI`, `LLAMA_ARG_STATIC_PATH`, `LLAMA_ARG_KVMEM_SWAP_UI` | UI enabled/disabled, static directory and the swap-status page |
 | `LLAMA_API_KEY`, `LLAMA_ARG_API_KEY_FILE` | Authentication; no secret values are logged |
 | `LLAMA_ARG_JINJA`, `LLAMA_ARG_CHAT_TEMPLATE`, `LLAMA_ARG_CHAT_TEMPLATE_FILE`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS` | Templates; disabling Jinja is unsupported |
 | `LLAMA_ARG_REASONING_EFFORT`, `LLAMA_ARG_THINK_BUDGET`, `LLAMA_ARG_THINK_BUDGET_MESSAGE`, `LLAMA_ARG_TOP_K` | Reasoning and top-k sampling |
@@ -470,6 +499,7 @@ progress-reporting approach from [PR #9](https://github.com/kvmem/kvmem-llama.cp
 - `GET /health`
 - `GET /v1/models`
 - `POST /v1/chat/completions` (sampling, stream, tools, optional images)
+- `GET /kvmem/swap`, `GET /kvmem/swap/status`, `GET /kvmem/swap/block?id=N` (only with `--kvmem-swap-ui`)
 
 No auth or TLS unless an API key is set. Binds `127.0.0.1` by default. To serve
 on the LAN, pass `--host 0.0.0.0` to the server or to the launchers

@@ -63,6 +63,7 @@ struct kvmem_server_options {
     int sink_tokens = 0; // Zero keeps one block; positive values round down to whole blocks.
     int verbosity = 3; // Same default and levels as llama-server.
     int trace = -1; // -1 inherits KVMEM_TRACE; CLI overrides only after parsing.
+    bool swap_ui = false; // --kvmem-swap-ui: serve the swap-status page (default off).
     int threads = -1;
     int threads_batch = -1;
     int ubatch = 0; // Omission preserves the existing batch-size default.
@@ -153,6 +154,8 @@ struct kvmem_server_options {
     bool parse(const std::string & arg, const Need & need) {
         if (arg == "--kvmem-sink-tokens") {
             sink_tokens = kvmem_cli_int(arg.c_str(), need(arg.c_str()));
+        } else if (arg == "--kvmem-swap-ui" || arg == "--no-kvmem-swap-ui") {
+            swap_ui = arg == "--kvmem-swap-ui";
         } else if (arg == "--kvmem-trace" || arg == "--no-kvmem-trace") {
             trace = arg == "--kvmem-trace" ? 1 : 0;
         } else if (arg == "-lv" || arg == "--verbosity" || arg == "--log-verbosity") {

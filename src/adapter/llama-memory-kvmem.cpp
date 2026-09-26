@@ -3853,6 +3853,34 @@ uint32_t llama_kvmem_store_n_tokens(void) {
     return 0;
 }
 
+llama_kvmem_swap_status llama_kvmem_get_swap_status() {
+    llama_kvmem_swap_status out;
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem) return out;
+    out.block_tokens = mem->block_tokens();
+    out.n_slots = mem->n_slots();
+    out.free_slots = (uint32_t) mem->free_slot_count();
+    out.store_tokens = mem->store_n_tokens();
+    const auto & store = mem->runtime().store();
+    out.blocks.reserve(store.block_count());
+    for (const auto & b : store.blocks()) {
+        llama_kvmem_block_info info;
+        info.block_id = b.block_id;
+        info.orig_pos_start = b.orig_pos_start;
+        info.n_tokens = b.n_tokens;
+        info.tier = (int32_t) b.tier;
+        info.gpu_slot = b.gpu_slot;
+        info.cpu_slot = b.cpu_slot;
+        info.nvme_slot = b.nvme_slot;
+        info.in_working_set = b.in_working_set;
+        info.in_flight = b.in_flight;
+        info.remap_count = b.remap_count;
+        info.retrieval_score = b.retrieval_score;
+        out.blocks.push_back(info);
+    }
+    return out;
+}
+
 void llama_kvmem_truncate_cached(uint32_t n_past) {
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->truncate_cached(n_past);

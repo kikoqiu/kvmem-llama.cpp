@@ -49,6 +49,7 @@ inline const std::vector<kvmem_env_option> & kvmem_env_options() {
         {"LLAMA_ARG_CHAT_TEMPLATE", "--chat-template"}, {"LLAMA_ARG_CHAT_TEMPLATE_FILE", "--chat-template-file"},
         {"LLAMA_ARG_SPEC_TYPE", "--spec-type"}, {"LLAMA_ARG_SPEC_DRAFT_N_MAX", "--spec-draft-n-max"},
         {"LLAMA_ARG_SPEC_DRAFT_P_MIN", "--spec-draft-p-min"},
+        {"LLAMA_ARG_KVMEM_SWAP_UI", "--kvmem-swap-ui", "--no-kvmem-swap-ui"},
     };
     return values;
 }
@@ -113,6 +114,7 @@ inline std::string kvmem_config_key(const char * raw) {
         {"-ctv", "--cache-type-v"}, {"--no-ui", "--ui"}, {"--webui", "--ui"},
         {"--no-jinja", "--jinja"}, {"--no-mmproj-offload", "--mmproj-offload"},
         {"--chat-template-file", "--chat-template"}, {"--no-kvmem", "--kvmem"},
+        {"--no-kvmem-swap-ui", "--kvmem-swap-ui"},
     };
     const auto it = aliases.find(arg);
     return it == aliases.end() ? arg : it->second;

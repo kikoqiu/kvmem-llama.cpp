@@ -9,6 +9,7 @@
 #include "kvmem-server-options.h"
 #include "kvmem-server-auth.h"
 #include "kvmem-server-progress.h"
+#include "kvmem-swap-status.h"
 #include "kvmem-server-devices.h"
 #include "kvmem-server-env.h"
 #include "kvmem-vision.h"
@@ -144,7 +145,9 @@ static void print_usage(const char * argv0) {
             "  --reasoning-budget N       thinking token budget: -1 unlimited, 0 end immediately,\n"
             "                            N>0 force </think> after N think tokens (default -1)\n"
             "  --reasoning-budget-message MSG  injected before forced </think> (default none)\n"
-            "  --webui                    serve bundled chat UI (default on)\n",
+            "  --webui                    serve bundled chat UI (default on)\n"
+            "  --kvmem-swap-ui            serve the swap-status page on /kvmem/swap (default off)\n"
+            "  --no-kvmem-swap-ui         disable the swap-status page (default)\n",
             argv0);
 }
 
@@ -219,6 +222,8 @@ struct ServerState {
     std::mutex mu;
     kvmem_server_progress progress;
     kvmem_server_log log;
+    bool swap_ui = false; // --kvmem-swap-ui: serve /kvmem/swap
+    kvmem_swap_publisher swap_pub;
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
     const llama_vocab * vocab = nullptr;
@@ -416,6 +421,36 @@ static int common_token_prefix(const std::vector<llama_token> & a,
     return i;
 }
 
+// Model thread only: it walks the block table and the token timeline, which the
+// model thread owns. `with_tokens` republishes the detokenization source, which
+// only needs to change when a turn commits.
+static void publish_swap_status(ServerState & st, bool with_tokens, bool force = false) {
+    if (!st.swap_ui) return;
+    const auto raw = llama_kvmem_get_swap_status();
+    std::vector<kvmem_swap_block> blocks;
+    blocks.reserve(raw.blocks.size());
+    uint32_t resident = 0;
+    for (const auto & b : raw.blocks) {
+        kvmem_swap_block row;
+        row.id = b.block_id;
+        row.pos = b.orig_pos_start;
+        row.n_tokens = b.n_tokens;
+        row.tier = b.tier;
+        row.gpu_slot = b.gpu_slot;
+        row.cpu_slot = b.cpu_slot;
+        row.nvme_slot = b.nvme_slot;
+        row.working = b.in_working_set;
+        row.in_flight = b.in_flight;
+        row.remaps = b.remap_count;
+        if (b.tier == 0) ++resident;
+        blocks.push_back(row);
+    }
+    std::shared_ptr<const std::vector<llama_token>> tokens;
+    if (with_tokens) tokens = std::make_shared<const std::vector<llama_token>>(st.cached_tokens);
+    st.swap_pub.publish(std::move(blocks), raw.block_tokens, raw.n_slots, raw.free_slots, raw.store_tokens,
+                        resident, std::move(tokens), force);
+}
+
 static void memory_clear_all(ServerState & st) {
     llama_memory_t mem = llama_get_memory(st.ctx);
     if (mem) {
@@ -450,6 +485,7 @@ static void memory_clear_all(ServerState & st) {
     st.last_query_end = -1;
     st.last_user_text.clear();
     st.last_n_gen = 0;
+    publish_swap_status(st, true, true);
 }
 
 // Persist GDN after a successful prefill (eval_end-1) for the next turn's
@@ -487,6 +523,7 @@ static void commit_cached(ServerState & st, const std::vector<llama_token> & pro
     kvmem_diag("KVMEM_TRACE cache_commit n_prompt=%d n_gen=%d n_cached=%d stored=%u\n",
             (int) prompt.size(), (int) gen.size(), (int) st.cached_tokens.size(),
             llama_kvmem_store_n_tokens());
+    publish_swap_status(st, true, true);
 }
 
 static int decode_span(llama_context * ctx, const llama_token * toks, int pos0, int pos1, int n_batch,
@@ -765,6 +802,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
         kvmem_diag("KVMEM_TRACE query_reuse_q reselect=1 query=[%d,%d) n_past=%d n_new=%d\n",
                 q0, q1, n_past, eval_end - n_past);
         llama_kvmem_apply_retrieval(ctx);
+        publish_swap_status(st, false);
         if (!dec(n_past, eval_end, "prefill-tail")) {
             return false;
         }
@@ -853,6 +891,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
 
     if (tail_fits_gen) {
         llama_kvmem_apply_retrieval(ctx);
+        publish_swap_status(st, false);
         if (!replay_fits) {
             kvmem_diag("KVMEM_TRACE query_replay_skip query=[%d,%d) eval_end=%d "
                     "(sink+suffix exceeds GPU budget)\n",
@@ -920,6 +959,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
             return false;
         }
         llama_kvmem_apply_retrieval(ctx);
+        publish_swap_status(st, false);
     }
     if (st.spec.ctx_dft) {
         llama_memory_t md = llama_get_memory(st.spec.ctx_dft);
@@ -1872,6 +1912,7 @@ int main(int argc, char ** argv) {
         }
     }
     st.kparams.sink_tokens = static_cast<uint32_t>(options.sink_tokens);
+    st.swap_ui = options.swap_ui;
     // Some pinned llama.cpp trace sites test presence rather than the value.
     // Normalize "0"/empty and CLI-off to an absent variable before loading models.
     const bool trace = options.trace == -1 ? kvmem_diag_enabled() : options.trace != 0;
@@ -2073,6 +2114,9 @@ int main(int argc, char ** argv) {
     }
 
     httplib::Server svr;
+    // One snapshot before serving, so /kvmem/swap/status can tell "KVMem is off"
+    // (no GPU pool) from "on, nothing cached yet".
+    publish_swap_status(st, true, true);
     svr.set_read_timeout(options.timeout, 0);
     svr.set_write_timeout(options.timeout, 0);
     if (options.threads_http_set) {
@@ -2093,6 +2137,10 @@ int main(int argc, char ** argv) {
 
     std::unordered_set<std::string> ui_paths;
     if (!kvmem_mount_ui(svr, ui_dir, no_ui, argv[0], &ui_paths)) return 1;
+    // The swap-status page is static markup with no model data in it, so it
+    // stays reachable in a browser when an API key is set. Its data routes
+    // below stay behind the key like /props and /slots.
+    if (options.swap_ui) ui_paths.insert("/kvmem/swap");
     kvmem_install_auth(svr, options.api_keys, std::move(ui_paths));
     // v1 capped a generation at gen_reserve so the pinned pool could not
     // overflow. The retrieval overflow policy reswaps the pool instead, so only
@@ -2215,6 +2263,48 @@ int main(int argc, char ** argv) {
         }
         res.set_content(json::array({slot}).dump(), "application/json");
     });
+    // Swap-status page (--kvmem-swap-ui). The model thread publishes snapshots
+    // and these handlers only read them, so polling never waits for inference.
+    if (options.swap_ui) {
+        svr.Get("/kvmem/swap", [](const httplib::Request &, httplib::Response & res) {
+            res.set_header("Cache-Control", "no-store");
+            res.set_content(kvmem_swap_page_html(), "text/html; charset=utf-8");
+        });
+        svr.Get("/kvmem/swap/status", [&](const httplib::Request & req, httplib::Response & res) {
+            res.set_header("Cache-Control", "no-store");
+            int interval = 1000;
+            if (req.has_param("interval")) {
+                try {
+                    interval = kvmem_cli_int("interval", req.get_param_value("interval").c_str(), 250, 60000);
+                } catch (const std::invalid_argument &) {
+                    interval = 1000;
+                }
+            }
+            const auto snap = st.swap_pub.get();
+            const double age_ms = snap.valid ? std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - snap.stamp).count() : 0.0;
+            res.set_content(kvmem_swap_status_json(snap, age_ms, interval).dump(), "application/json");
+        });
+        svr.Get("/kvmem/swap/block", [&](const httplib::Request & req, httplib::Response & res) {
+            res.set_header("Cache-Control", "no-store");
+            long long id = -1;
+            if (req.has_param("id")) {
+                try {
+                    id = std::stoll(req.get_param_value("id"));
+                } catch (const std::exception &) {
+                    id = -1;
+                }
+            }
+            const json out = kvmem_swap_block_json(st.swap_pub.get(), st.vocab, id);
+            if (out.empty()) {
+                res.status = 404;
+                res.set_content(json{{"error", "unknown block id"}}.dump(), "application/json");
+                return;
+            }
+            res.set_content(out.dump(), "application/json");
+        });
+        fprintf(stderr, "KVMEM_SWAP_UI routes=/kvmem/swap /kvmem/swap/status /kvmem/swap/block\n");
+    }
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {
             {"object", "list"},
@@ -2478,9 +2568,11 @@ int main(int argc, char ** argv) {
             const int cache_n = std::clamp(n_cache_hit, 0, n_prompt);
             const int prompt_n = n_prompt - cache_n;
             st.progress.prefilled(cache_n);
+            publish_swap_status(st, false, true);
             st.log.start_generation();
             return [timings, &st, t_turn0, t_pf1, prefill_ms, n_prompt, prompt_n, cache_n](int n_gen, bool verbose = true) {
                 st.progress.generated(n_gen);
+                publish_swap_status(st, false);
                 st.log.generated(n_gen);
                 const auto now = std::chrono::steady_clock::now();
                 const double gen_ms = std::chrono::duration<double, std::milli>(now - t_pf1).count();
@@ -2773,6 +2865,7 @@ int main(int argc, char ** argv) {
                         gen.push_back(id);
                         content += piece;
                         st.progress.generated((int) gen.size());
+                        publish_swap_status(st, false);
                         st.log.generated((int) gen.size());
                     }, [&]() { return !stream_heartbeat(&io); },
                     st.active_prompt->model_pos(toks.size()) - (llama_pos) toks.size());
@@ -2844,6 +2937,7 @@ int main(int argc, char ** argv) {
             content += piece;
             gen.push_back(id);
             st.progress.generated((int) gen.size());
+            publish_swap_status(st, false);
             st.log.generated((int) gen.size());
             if (strip_stop(content, stops)) {
                 break;

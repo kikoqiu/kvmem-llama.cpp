@@ -137,6 +137,34 @@ struct llama_kvmem_transfer_stats {
 };
 LLAMA_API llama_kvmem_transfer_stats llama_kvmem_get_transfer_stats();
 void kvmem_record_transfer(int cuda_kind, uint64_t bytes);
+
+// One host block-table row for the swap-status page. tier: 0 GPU, 1 CPU, 2 SSD.
+struct llama_kvmem_block_info {
+    uint32_t block_id = 0;
+    uint32_t orig_pos_start = 0;
+    uint32_t n_tokens = 0;
+    int32_t  tier = 0;
+    int32_t  gpu_slot = -1;
+    int32_t  cpu_slot = -1;
+    int32_t  nvme_slot = -1;
+    bool     in_working_set = false;
+    bool     in_flight = false;
+    uint32_t remap_count = 0;
+    double   retrieval_score = 0.0;
+};
+
+struct llama_kvmem_swap_status {
+    uint32_t block_tokens = 0;
+    uint32_t n_slots = 0;      // GPU pool slots
+    uint32_t free_slots = 0;
+    uint32_t store_tokens = 0; // logical tokens held by the host store
+    std::vector<llama_kvmem_block_info> blocks;
+};
+
+// Snapshot of the host block table. It walks model-thread buffers, so the
+// caller must own the inference serialization (the server request lock).
+LLAMA_API llama_kvmem_swap_status llama_kvmem_get_swap_status();
+
 struct llama_kvmem_turn_spans {
     std::vector<llama_kvmem_row_range> query;
     std::vector<llama_kvmem_row_range> mandatory;

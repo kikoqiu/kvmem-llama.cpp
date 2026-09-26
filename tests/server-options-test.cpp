@@ -38,6 +38,10 @@ int main() {
     }
     parse("--kvmem-trace", ""); check(o.trace == 1);
     parse("--no-kvmem-trace", ""); check(o.trace == 0);
+    check(o.swap_ui == false);
+    parse("--kvmem-swap-ui", ""); check(o.swap_ui == true);
+    parse("--no-kvmem-swap-ui", ""); check(o.swap_ui == false);
+    check(kvmem_config_key("--no-kvmem-swap-ui") == "--kvmem-swap-ui");
     parse("-t", "3"); parse("-tb", "5"); parse("-ub", "64");
     check(o.threads == 3 && o.threads_batch == 5 && o.ubatch == 64);
     parse("--flash-attn", "off"); check(o.flash_attn == LLAMA_FLASH_ATTN_TYPE_DISABLED);
