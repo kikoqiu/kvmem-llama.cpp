@@ -108,6 +108,8 @@ static void print_usage(const char * argv0) {
             "  --kvmem-block-tokens N     block size (default 128)\n"
             "  --kvmem-sink-tokens N      always-kept prefix; default 0 = one block; rounds down, minimum one block\n"
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
+            "  --kvmem-gen-exceed MODE    decode past gen_reserve: retrieval | error\n"
+            "                            retrieval reswaps budget+gen_reserve and continues (default)\n"
             "  --kvmem-recent-tokens N    always-kept newest suffix in select budget (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
             "  --kvmem-prefill-method M   recency | retrieval (default retrieval): prefill pressure policy\n"
@@ -1609,6 +1611,7 @@ int main(int argc, char ** argv) {
     st.kparams.mtp_state = 2; // ReplaySSM by default when MTP is enabled.
     st.kparams.block_tokens = 128;
     st.kparams.gen_reserve = 256;
+    st.kparams.gen_exceed = 1;
     st.kparams.recent_tokens = 0;
     st.kparams.method = 1;
     st.kparams.prefill_method = 1;
@@ -1710,6 +1713,13 @@ int main(int argc, char ** argv) {
             st.kparams.block_tokens = (uint32_t) kvmem_cli_int(arg, need(arg));
         } else if (eq(arg, "--kvmem-gen-reserve")) {
             st.kparams.gen_reserve = (uint32_t) kvmem_cli_int(arg, need(arg));
+        } else if (eq(arg, "--kvmem-gen-exceed")) {
+            const std::string mode = need(arg);
+            if (mode != "error" && mode != "retrieval") {
+                fprintf(stderr, "invalid --kvmem-gen-exceed (want error|retrieval)\n");
+                return 1;
+            }
+            st.kparams.gen_exceed = mode == "retrieval" ? 1 : 0;
         } else if (eq(arg, "--kvmem-recent-tokens")) {
             const int v = kvmem_cli_int(arg, need(arg));
             if (v < 0) {
@@ -1983,6 +1993,7 @@ int main(int argc, char ** argv) {
         {"n_predict", st.n_predict_default},
         {"kv", {{"k", ggml_type_name(st.cache_type_k)}, {"v", ggml_type_name(st.cache_type_v)}}},
         {"kvmem", {{"enabled", st.kparams.enabled}, {"budget", st.kparams.budget}, {"gen_reserve", st.kparams.gen_reserve},
+                   {"gen_exceed", st.kparams.gen_exceed == 1 ? "retrieval" : "error"},
                    {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
         {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
         {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu}}},
@@ -2083,8 +2094,17 @@ int main(int argc, char ** argv) {
     std::unordered_set<std::string> ui_paths;
     if (!kvmem_mount_ui(svr, ui_dir, no_ui, argv[0], &ui_paths)) return 1;
     kvmem_install_auth(svr, options.api_keys, std::move(ui_paths));
-    const int generation_limit = st.kparams.enabled && st.kparams.gen_reserve > 0 ?
+    // v1 capped a generation at gen_reserve so the pinned pool could not
+    // overflow. The retrieval overflow policy reswaps the pool instead, so only
+    // the logical context caps generation.
+    const bool gen_reserve_cap = st.kparams.enabled && st.kparams.gen_reserve > 0 &&
+        st.kparams.gen_exceed != 1;
+    const int generation_limit = gen_reserve_cap ?
         std::min(n_ctx, (int) st.kparams.gen_reserve) : n_ctx;
+    // An omitted max_tokens keeps the recipe's reserve as the output default.
+    const int output_default = st.n_predict_default > 0 ? st.n_predict_default :
+        (st.kparams.enabled && st.kparams.gen_reserve > 0 ? (int) st.kparams.gen_reserve : generation_limit);
+    const int default_max_tokens = std::min(output_default, generation_limit);
     startup["context_actual"] = llama_n_ctx(st.ctx);
     startup["batch_actual"] = llama_n_batch(st.ctx);
     startup["ubatch_actual"] = llama_n_ubatch(st.ctx);
@@ -2092,7 +2112,7 @@ int main(int argc, char ** argv) {
     startup["threads_batch_actual"] = llama_n_threads_batch(st.ctx);
     startup["flash_attn_requested"] = llama_flash_attn_type_name(cparams.flash_attn_type);
     startup["generation_limit"] = generation_limit;
-    startup["default_max_tokens"] = std::min(st.n_predict_default > 0 ? st.n_predict_default : generation_limit, generation_limit);
+    startup["default_max_tokens"] = default_max_tokens;
     startup["http"]["threads"] = options.threads_http_set ?
         (options.threads_http > 0 ? options.threads_http : std::max(5, static_cast<int>(std::thread::hardware_concurrency()) - 1)) :
         static_cast<int>(CPPHTTPLIB_THREAD_POOL_COUNT);
@@ -2104,7 +2124,7 @@ int main(int argc, char ** argv) {
     const auto thinking_params = kvmem_ui_sampling(true, st.sampling_overrides);
     const auto plain_params = kvmem_ui_sampling(false, st.sampling_overrides);
     auto default_params = st.enable_thinking_default ? thinking_params : plain_params;
-    default_params["n_predict"] = std::min(st.n_predict_default > 0 ? st.n_predict_default : generation_limit, generation_limit);
+    default_params["n_predict"] = default_max_tokens;
     default_params["max_tokens"] = default_params["n_predict"];
     // 1:1 upstream /props extras (server-context.cpp get_res_props).
     // 中文：除 kvmem 扩展字段外，补齐上游 /props 的标准字段（bos/eos token、模板能力等）
@@ -2215,7 +2235,9 @@ int main(int argc, char ** argv) {
             return;
         }
         ChatRequest cr;
-        cr.max_tokens = st.n_predict_default;
+        // Seed the effective output length. kvmem_output_limit falls back to this
+        // when the request omits max_tokens; the cap is a separate value.
+        cr.max_tokens = default_max_tokens;
         cr.enable_thinking = st.enable_thinking_default;
         cr.template_kwargs = st.template_kwargs;
         cr.reasoning_budget_tokens = st.reasoning_budget_default;
@@ -2285,19 +2307,29 @@ int main(int argc, char ** argv) {
             return;
         }
         st.active_prompt = parsed_prompt;
-        st.turn_generation_rows = (uint32_t) std::min<uint64_t>(UINT32_MAX,
-                (uint64_t) std::max(0, cr.max_tokens) + (st.spec.ok ? std::max(0, st.spec_n_max) + 1u : 0u));
         auto toks = parsed_prompt->tokens;
         if (toks.empty()) {
             res.status = 400;
             res.set_content("{\"error\":\"empty prompt\"}", "application/json");
             return;
         }
-        if ((int) toks.size() + cr.max_tokens > (int) llama_n_ctx(st.ctx)) {
-            res.status = 400;
-            res.set_content("{\"error\":\"prompt + max_tokens exceeds n_ctx\"}", "application/json");
-            return;
+        // Upstream llama-server clamps n_predict to what the context still holds.
+        // Do the same so a client that echoes generation_limit keeps working;
+        // an oversized prompt stays a plain error.
+        const int n_ctx_now = (int) llama_n_ctx(st.ctx);
+        if ((int) toks.size() + cr.max_tokens > n_ctx_now) {
+            const int fit = n_ctx_now - (int) toks.size();
+            if (fit < 1) {
+                res.status = 400;
+                res.set_content("{\"error\":\"prompt exceeds n_ctx\"}", "application/json");
+                return;
+            }
+            LOG_WRN("slot   max_tokens %d with %d prompt tokens exceeds n_ctx %d; using %d\n",
+                    cr.max_tokens, (int) toks.size(), n_ctx_now, fit);
+            cr.max_tokens = fit;
         }
+        st.turn_generation_rows = (uint32_t) std::min<uint64_t>(UINT32_MAX,
+                (uint64_t) std::max(0, cr.max_tokens) + (st.spec.ok ? std::max(0, st.spec_n_max) + 1u : 0u));
 
         int qbegin = cr.query_begin;
         int qend = cr.query_end;

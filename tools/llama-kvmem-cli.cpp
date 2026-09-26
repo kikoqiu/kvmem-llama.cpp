@@ -31,6 +31,7 @@ static void print_usage(const char * argv0) {
             "  --kvmem-block-tokens N     block size (default 32)\n"
             "  --kvmem-budget N           GPU working-set tokens; 0 = n_ctx (identity)\n"
             "  --kvmem-gen-reserve N      extra GPU tokens for decode (default 256)\n"
+            "  --kvmem-gen-exceed MODE    decode past gen_reserve: retrieval | error (default retrieval)\n"
             "  --kvmem-sink-tokens N      always-kept prefix; 0 = one block\n"
             "  --kvmem-recent-tokens N    always-kept suffix blocks (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
@@ -80,6 +81,7 @@ int main(int argc, char ** argv) {
     llama_kvmem_params kparams = {};
     kparams.block_tokens = 32;
     kparams.gen_reserve = 256;
+    kparams.gen_exceed = 1;  // retrieval: reswap budget+gen_reserve past the reserve
     kparams.method = 1;  // retrieval
     kparams.prefill_method = 1;  // retrieval
     kparams.query_begin = -1;
@@ -139,6 +141,16 @@ int main(int argc, char ** argv) {
             kparams.budget = static_cast<uint32_t>(std::atoi(need(arg)));
         } else if (eq(arg, "--kvmem-gen-reserve")) {
             kparams.gen_reserve = static_cast<uint32_t>(std::atoi(need(arg)));
+        } else if (eq(arg, "--kvmem-gen-exceed")) {
+            const char * m = need(arg);
+            if (eq(m, "retrieval") || eq(m, "retrieve")) {
+                kparams.gen_exceed = 1;
+            } else if (eq(m, "error")) {
+                kparams.gen_exceed = 0;
+            } else {
+                fprintf(stderr, "invalid --kvmem-gen-exceed (want error|retrieval)\n");
+                return 1;
+            }
         } else if (eq(arg, "--kvmem-sink-tokens")) {
             kparams.sink_tokens = static_cast<uint32_t>(std::atoi(need(arg)));
         } else if (eq(arg, "--kvmem-recent-tokens")) {

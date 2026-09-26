@@ -116,6 +116,10 @@ public:
     llama_kvmem_attention_view attention_view(bool canonical = true) const;
     bool can_append(uint32_t end, uint32_t generation_rows, bool all_history, std::string & reason) const;
     llama_kvmem_selection preview_retrieval();
+    // Decode ran out of gen_reserve slots. gen_exceed == 1 reswaps the whole
+    // pool (budget + gen_reserve) once so the reserve region is free again.
+    // False keeps the v1 error path.
+    bool gen_overflow_swap(uint32_t t0, uint32_t t1, const std::vector<uint32_t> & incoming);
     bool selection_fits(const llama_kvmem_selection & selection, uint32_t end, uint32_t generation_rows) const;
     bool commit_unchanged(const llama_kvmem_attention_view & view, const llama_kvmem_selection & selection);
     void apply_selection(const llama_kvmem_selection & selection);
@@ -214,6 +218,9 @@ private:
     bool gpu_kv_already_resident(uint32_t block_id) const;
     bool gpu_kv_complete(uint32_t block_id, const llama_kv_cache * cache) const;
     std::vector<uint32_t> retrieval_mandatory() const;
+    // Scored reselect with an explicit mandatory set (decode overflow uses the
+    // request query plus the live generation tail).
+    llama_kvmem_selection reselect(const std::vector<uint32_t> & mandatory);
     void occupy_block_cells(uint32_t block_id);
     void reset_slots();
     void trace_plan(const char * tag, const kvmem::KvMemPlan & plan) const;
@@ -381,6 +388,8 @@ private:
     bool prefill_capture_ = true;
     int32_t method_ = 0;
     int32_t prefill_method_ = 0;
+    int32_t gen_exceed_ = 1;
+    uint32_t gen_swaps_ = 0;
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
     int32_t force_pos_ = -1;

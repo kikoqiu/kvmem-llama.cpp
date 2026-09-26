@@ -55,81 +55,94 @@ the prefill budget, keeping the request query span mandatory. No user span yet
 (system prompt, first message) means no query, and the policy stays recency.
 Raw completion and the CLI have no chat roles, so they keep recency.
 
-## Known v1 limit: generation length vs `gen_reserve`
+## Generation length vs `gen_reserve`
 
 GPU pool = `budget` (selected working set) + `gen_reserve` (decode slack).
 After retrieval the selected blocks are **pinned**: decode must not
 recency-reselect and drop resurrected blocks. New tokens only take free
-slots in `gen_reserve`.
+slots in `gen_reserve`. `--kvmem-gen-exceed` (server and CLI, default
+`retrieval`) decides what happens when those slots fill.
 
-If the last GPU block is full and there is no free slot left,
-`prepare_working_set` fails with `no free GPU slot for block N`
-(`llama_decode(gen) failed rc=1`). It does **not** evict pinned
-retrieval blocks. One generation therefore cannot exceed
-`--kvmem-gen-reserve` (16384 on IQ3, 12288 on IQ4, CLI default 256),
-including thinking. README documents this and a system-prompt cap.
-We are working on the follow-up below.
+`retrieval`: the last GPU block is full and no slot is free, so the adapter
+reselects across the whole pool once - `budget` plus `gen_reserve`.
+Candidates are every stored block, including the rows decode just wrote, and
+they are ranked by the same retrieval score as any other history block. Only
+the losers are staged out. Mandatory: the request query, the incoming rows,
+and the block holding the row before the ubatch, which the next token
+attends. Outgoing blocks are harvested to the packed host copy before they
+leave, so a later stage-in restores them. Spilled generation blocks carry
+decode mean-K and are selectable again by a later turn's query.
+
+`error`: the v1 behavior. `prepare_working_set` fails with
+`no free GPU slot for block N` (`llama_decode(gen) failed rc=1`), and one
+generation cannot exceed `--kvmem-gen-reserve` (16384 on IQ3, 12288 on IQ4,
+CLI default 256), thinking included. `llama-kvmem-server` caps `max_tokens`
+at the reserve in this mode; with the retrieval default the logical context
+(`-c`) is the only limit.
+
+The swap is an ordinary retrieval reselect, so it needs the packed host copy
+of every block it drops. Packed V exists only with flash attention
+(`-fa on`, which the 16 GiB recipes use); a transposed-V build falls back to
+the error path.
 
 ### Why not steal slots from the selected set
 
 The pool is already two partitions. Selected KV occupies `budget` slots
 and stays pinned. Generation occupies `gen_reserve` slots. When those
 are full, the card is not “choose generation or retrieval”: only the
-reserve partition is full. Unpinning or recency-evicting selected
-blocks would drop the query’s retrieved facts. Growing `budget +
+reserve partition is full. Unpinning and recency-evicting the selected
+blocks would drop the query’s retrieved facts, so the swap reselects with
+the query still mandatory. Growing `budget +
 gen_reserve` on 16 GiB is also out: recipes already sit near 15.5 GiB.
 Streaming the whole generation through VRAM would bring back the
 adaptive-KV-streaming cost curve. NVMe is not implemented in this port;
 host RAM is enough for spilled gen KV.
 
-### Follow-up: ring buffer **inside** `gen_reserve`
+### What the swap keeps
 
-No third pool and no extra VRAM. `gen_reserve` becomes “how much of
-**this turn’s** output attention can still see”, not a hard max length.
+No third pool and no extra VRAM. `gen_reserve` is “how much of **this
+turn’s** output attention can still see”, not a hard max length.
 
-On pin, record `gen_start_pos`. When `alloc_slot()` fails:
+Rules the swap follows:
 
-1. Evict only the **oldest completed generation block**
-   (`orig_pos_start >= gen_start_pos`, block full, `gpu_slot >= 0`).
-2. Never evict the in-progress block, and never evict selected /
-   pinned blocks (those slots stay out of the free list).
-3. The block is already harvested to the host store (decode mean-K /
-   packed copy). Stage it out, `free_slot`, retry `alloc_slot`.
-4. Spill **one** block per event. Grain is `--kvmem-block-tokens`
-   (128 on the 16 GiB recipes). One q8 block is a few MiB; PCIe is
-   cheap next to 128 decode steps. Larger batches (1K/2K) save almost
-   no bandwidth and yank a long stretch of self-output off GPU at
-   once. Smaller than `block_tokens` would change global slot
-   geometry; do not do that for the ring.
+1. Mandatory (the selector keeps these first): the incoming rows, the block
+   that holds the row before the ubatch, and the request query span.
+   Mandatory is filled newest-first, so a query span that cannot fit loses its
+   oldest blocks.
+2. Then the sink prefix (`--kvmem-sink-tokens`, default one block) and the
+   `--kvmem-recent-tokens` suffix keep their existing policy.
+3. Every other block - this turn's already written blocks and older history
+   alike - is an ordinary candidate. They compete on the same retrieval score
+   (query mean-Q against block mean-K, newest block wins a tie); the lowest
+   scorers are staged out. No rule evicts this turn's blocks first.
+4. Every block that loses is harvested first (packed K/V, decode mean-K), so
+   the host store stays the authority and a later turn can stage it back in.
+5. Grain is one reselect, not one block. `--kvmem-block-tokens` (128 on the
+   16 GiB recipes) sets the transfer unit; a swap moves only the blocks the
+   new window does not keep.
 
-After a spill, GPU still holds: the full selected window + the most
-recent ~`gen_reserve` tokens of this generation. Keep at least the
-in-progress block (do not attend to only the current 128 tokens by
-dumping every completed gen block). MTP’s follower pool uses the same
-slot indices; free the same slot on the draft cache. GDN / recurrent
-state is updated every token and does not live in these attention
-slots.
+After a swap, GPU still holds the new selected window plus the tail block
+that decode is writing. MTP’s follower pool uses the same slot indices; the
+same blocks leave the draft cache. GDN / recurrent state is updated every
+token and does not live in these attention slots, so it is not part of the
+swap.
 
-Spilled gen KV stays in the host store. The next turn’s retrieval can
-select it. This turn’s Flash Attention does not see it.
+Spilled gen KV stays in the host store. This turn’s Flash Attention does not
+see it; the next turn’s retrieval can select it.
 
-**Tail size.** Keep the current recipe reserves: 16K (IQ3) / 12K
-(IQ4). That VRAM is already paid. It covers the default 4096 thinking
-budget plus a normal answer without spinning the ring. 4K would cover
-thinking but drop long code; 32K would steal from `budget` or blow
-16 GiB. After the ring exists, do not add slots.
+**Tail size.** Keep the current recipe reserves: 16K (IQ3) / 12K (IQ4).
+That VRAM is already paid. It covers the default 4096 thinking budget plus a
+normal answer without a swap. 4K would cover thinking but drop long code;
+32K would steal from `budget` or blow 16 GiB.
 
 **Quality.** The hard crash goes away. A 32K thinking dump still only
-attends to the last 12K/16K of itself. The system-prompt cap remains
-useful. Seeing earlier thoughts in the same turn would be a later
-step (retrieve from spilled gen blocks using the current generation
-as query), not part of this fix.
+attends to the last 12K/16K of itself plus what the query scores. The
+system-prompt cap remains useful. Seeing earlier thoughts in the same turn
+would be a later step (retrieve from spilled gen blocks using the current
+generation as query), not part of this cut.
 
-**First implementation cut.** Pin records `gen_start_pos`;
-`alloc_slot` failure evicts one full gen block; generate longer than
-`gen_reserve` without dropping a retrieved needle. Recency decode’s
-`block_count() > budget` mis-trigger is the same class of pin bug
-and stays out of this cut.
+**Recency decode.** Its `block_count() > budget` mis-trigger is the same
+class of pin bug and stays out of this cut.
 
 ## P7: MTP shares the slot-pool (plan B)
 

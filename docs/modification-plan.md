@@ -60,8 +60,8 @@
 
 已知 v1 限制（后续单独立项，不挡当前 retrieval）：
 
-- **生成不能无限长（v1）。** retrieval pin 之后 decode 只吃 `gen_reserve` 空槽；槽满且当前块已写满则 `no free GPU slot` / `llama_decode(gen) failed`，**不会**为了续写去挤掉召回块。今天的办法是加大 `--kvmem-gen-reserve`，并在 agent prompt 里限制单轮（含思考）长度。
-- **后续：只在 `gen_reserve` 里做 ring。** 不新开第三块池、不加 VRAM、不从 pin 住的 select 里抠槽。`alloc_slot` 失败时只 evict **一块**已写满的生成块（粒度 = `--kvmem-block-tokens`，16 GiB 配方 128），KV 下到 host store；GPU 上仍是完整召回窗口 + 本轮最近约 `gen_reserve`（IQ3 16K / IQ4 12K）。正在写的块不动。MTP 跟同一 slot 下标。详见 `docs/architecture.md`「Known v1 limit」。
+- **生成长度（已实现）。** `--kvmem-gen-exceed retrieval`（默认）在 `gen_reserve` 槽位满时对整个池（`budget + gen_reserve`）重选一次：query 块保持 mandatory，落选块先 harvest（packed K/V + decode mean-K）再下到 host store，select 窗口回到 `budget` 内，`gen_reserve` 区重新空出来继续 decode。`--kvmem-gen-exceed error` 保留 v1 行为（`no free GPU slot` / `llama_decode(gen) failed`，server 把 `max_tokens` 夹到 `gen_reserve`）。swap 依赖 packed V，即需要 `-fa on`；转置 V 的构建回落 error。详见 `docs/architecture.md`「Generation length vs gen_reserve」。
+- **质量权衡。** swap 用同一套打分在「本轮已写块 + 历史块」里重选：sink 前缀、`--kvmem-recent-tokens` 后缀策略不变，query 块 / incoming 行 / 正在写的尾块先留，其余按分数竞争，落选的（可能是历史块，也可能是本轮块）留在 host store，下一轮 retrieval 可以再选回来。要保证本轮输出保留更长就调大 `--kvmem-recent-tokens`（前缀由 `--kvmem-sink-tokens` 控制）。「本轮内看到更早的思考」仍不在这个切口里。
 
 ---
 

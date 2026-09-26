@@ -25,6 +25,7 @@ struct llama_kvmem_params {
     uint32_t recent_tokens; // 0 → pressure uses newest tail only
     int32_t  method;        // 0 recency, 1 retrieval (CLI default 1)
     int32_t  prefill_method; // prefill-pressure policy: 0 recency, 1 retrieval (product default 1)
+    int32_t  gen_exceed;    // decode past gen_reserve: 0 error (v1), 1 retrieval swap (product default 1)
     int32_t  query_begin;   // original token pos, -1 = unset
     int32_t  query_end;     // exclusive, -1 = end of prompt
     int32_t  force_pos;     // include block containing this orig pos; -1 = none

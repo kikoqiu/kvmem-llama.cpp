@@ -549,6 +549,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     v_trans_ = !cparams.flash_attn;
     method_ = g_kvmem_params.method;
     prefill_method_ = g_kvmem_params.prefill_method;
+    gen_exceed_ = g_kvmem_params.gen_exceed;
     query_begin_ = g_kvmem_params.query_begin;
     query_end_ = g_kvmem_params.query_end;
     force_pos_ = g_kvmem_params.force_pos;
@@ -587,11 +588,12 @@ llama_memory_kvmem::llama_memory_kvmem(
         }
     }
     LLAMA_LOG_INFO(
-            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s prefill=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s\n",
+            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s prefill=%s gen_exceed=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s\n",
             __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
             rt_cfg.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
             prefill_method_ == 1 ? "retrieval" : "recency",
+            gen_exceed_ == 1 ? "retrieval" : "error",
             (int) g_kvmem_params.harvest_v,
             ggml_type_name(type_k_), ggml_type_name(type_v_),
             n_embd_k_, kvmem_n_attn_layers(model),
@@ -1359,14 +1361,26 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
             return false;
         }
     } else {
+        uint32_t needed = 0;
+        for (uint32_t id : incoming) {
+            if (store.blocks()[id].gpu_slot < 0) {
+                ++needed;
+            }
+        }
+        // Pinned retrieval never evicts the working set, so gen_reserve used to
+        // be a hard generation limit. The retrieval policy reswaps the whole
+        // pool once (budget + gen_reserve) and continues in the freed slots.
+        if (needed > free_slots_.size()) {
+            gen_overflow_swap(t0, t1, incoming);
+        }
         for (uint32_t id : incoming) {
             if (store.blocks()[id].gpu_slot >= 0) {
                 continue;
             }
             const int32_t slot = alloc_slot();
             if (slot < 0) {
-                // Pinned retrieval will not evict the working set. gen_reserve
-                // exhaustion is a known v1 limit (see docs/architecture.md).
+                // No free slot after the swap (or the policy keeps the v1
+                // gen_reserve limit; see docs/architecture.md).
                 LLAMA_LOG_ERROR("%s: no free GPU slot for block %u\n", __func__, id);
                 runtime_->truncate_to(t0);
                 return false;
@@ -3173,7 +3187,7 @@ std::vector<uint32_t> llama_memory_kvmem::retrieval_mandatory() const {
     return mandatory;
 }
 
-llama_kvmem_selection llama_memory_kvmem::preview_retrieval() {
+llama_kvmem_selection llama_memory_kvmem::reselect(const std::vector<uint32_t> & mandatory) {
     const int64_t t0 = ggml_time_us();
     const bool enabled = retr_.enabled;
     retr_ = RetrPerf{};
@@ -3185,7 +3199,7 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval() {
     llama_kvmem_selection selection;
     selection.epoch = attention_epoch_;
     selection.rows = store_n_tokens();
-    selection.blocks = runtime_->preview_reselect(retrieval_mandatory());
+    selection.blocks = runtime_->preview_reselect(mandatory);
     if (enabled) {
         retr_.flush_us = t1 - t0;
         retr_.score_us = t2 - t1;
@@ -3193,6 +3207,58 @@ llama_kvmem_selection llama_memory_kvmem::preview_retrieval() {
         retr_.total_us = ggml_time_us() - t0;
     }
     return selection;
+}
+
+llama_kvmem_selection llama_memory_kvmem::preview_retrieval() {
+    return reselect(retrieval_mandatory());
+}
+
+bool llama_memory_kvmem::gen_overflow_swap(uint32_t t0, uint32_t t1,
+                                           const std::vector<uint32_t> & incoming) {
+    // A later stage-in restores the packed K/V that stage-out saved. The
+    // transposed V layout (flash attention off) has no packed V, so that build
+    // keeps the v1 error instead of resurrecting empty blocks.
+    if (gen_exceed_ != 1 || method_ != 1 || !raw_ || !runtime_ || v_trans_) {
+        return false;
+    }
+    auto & store = runtime_->store();
+    if (block_tokens_ == 0 || t1 <= t0) {
+        return false;
+    }
+    std::vector<uint32_t> mandatory = retrieval_mandatory();
+    // Only the live rows are forced to stay. This turn's earlier blocks are
+    // ordinary candidates: they are scored with history, and only losers leave.
+    // The block holding the row before this ubatch is what the next token
+    // attends, and the host store has no packed copy of the live tail yet.
+    const uint32_t first = (t0 == 0 ? 0 : t0 - 1) / block_tokens_;
+    const uint32_t last = (t1 - 1) / block_tokens_;
+    for (uint32_t id = first; id <= last && id < store.block_count(); ++id) {
+        mandatory.push_back(id);
+    }
+    for (uint32_t id : incoming) {
+        if (id < store.block_count()) {
+            mandatory.push_back(id);
+        }
+    }
+    std::sort(mandatory.begin(), mandatory.end());
+    mandatory.erase(std::unique(mandatory.begin(), mandatory.end()), mandatory.end());
+    if (trace_) {
+        kvmem_diag("KVMEM_TRACE gen_exceed policy=retrieval rows=%u..%u resident=%u "
+                "mandatory=%zu free_slots=%zu\n",
+                t0, t1, resident_tokens(), mandatory.size(), free_slots_.size());
+    }
+    try {
+        // Reselect across budget + gen_reserve. The window still fits the
+        // selection budget, so the reserve region is free again afterwards.
+        apply_selection(reselect(mandatory));
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: gen_reserve reselect failed: %s\n", __func__, e.what());
+        return false;
+    }
+    LLAMA_LOG_INFO("%s: gen_reserve full, reselected budget+gen_reserve "
+            "(swap=%u rows=%u..%u resident=%u free_slots=%zu)\n",
+            __func__, ++gen_swaps_, t0, t1, resident_tokens(), free_slots_.size());
+    return peek_free_slot() >= 0;
 }
 
 bool llama_memory_kvmem::selection_fits(const llama_kvmem_selection & selection, uint32_t end, uint32_t generation_rows) const {

@@ -24,7 +24,7 @@ KVMem retrieves relevant historical blocks into a bounded GPU window, limiting t
 
 Current milestone: [`v0.16.0-rc3`](docs/milestones/v0.16.0-rc3.md) (pre-release).
 
-**Limitation:** one generation cannot exceed `--kvmem-gen-reserve` (16384 tokens on the IQ3 recipe, 12288 on IQ4), including thinking. Retrieval pins the GPU window; new tokens only use those reserved slots. We are working on fixing this. For agent use, add a line to the system prompt such as: *Keep each turn's output, including thinking, within 16384 tokens* (use 12288 on IQ4). That makes oversized single-turn replies much less likely.
+**Generation length.** `--kvmem-gen-reserve` is the decode slack inside the GPU pool (`budget + gen_reserve`). When a generation fills that slack, `--kvmem-gen-exceed retrieval` (the default) reselects the whole pool: this turn's already written blocks and older history are ranked by the same query score, the losers leave the GPU, the reserve region is free again, and decoding continues. `--kvmem-gen-exceed error` keeps the v1 behavior and stops with `no free GPU slot` once the reserve is full. The swap restores dropped blocks from the packed host copy, which needs flash attention (`-fa on`); without it the policy falls back to the error. For agent use, a system-prompt cap such as *Keep each turn's output, including thinking, within 16384 tokens* still keeps the working set stable for long turns.
 
 Version: **0.16.0-rc3**. See the [English / 中文 release notes](docs/releases/v0.16.0-rc3.md) for CUDA build choices and measured results.
 
@@ -41,12 +41,13 @@ Core flags (what the 16 GiB recipes still pass):
 | `-c` | Logical workspace, including history stored off GPU. 256K is the tested default; larger is experimental. |
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
 | `--kvmem-sink-tokens N` | Server and CLI: always keep the prefix in the GPU working set. Default `0` keeps one block (not disabled). Positive values round down to whole blocks, with a minimum of one block. For example, with block size 128, `1024` keeps 1024 tokens and `129` keeps 128. These blocks count toward `--kvmem-budget`. |
-| `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. **One generation cannot exceed this length** (including thinking). |
+| `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. When a generation fills them, `--kvmem-gen-exceed` decides what happens. |
+| `--kvmem-gen-exceed MODE` | `retrieval` (default) reswaps `budget + gen_reserve` once the reserve is full, which frees the reserve region and continues. `error` keeps the v1 stop and caps `max_tokens` at the reserve. The swap ranks this turn's blocks and older history on the same query score and stages out the losers. Kept before scoring: the `--kvmem-sink-tokens` prefix, the `--kvmem-recent-tokens` suffix, the query span, the incoming rows and the block being written. |
 | `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Use `-ctk q8_0 -ctv q4_0` for mixed precision. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
 
-KVMem retrieval is on by default, with 128-token blocks, query replay `auto`, query policy `user`, MTP draft length 3, F16 draft KV, and ReplaySSM. You do not need to pass those unless you are overriding them. GPU KV size is `budget + gen_reserve`. When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn.
+KVMem retrieval is on by default, with 128-token blocks, query replay `auto`, query policy `user`, MTP draft length 3, F16 draft KV, and ReplaySSM. You do not need to pass those unless you are overriding them. GPU KV size is `budget + gen_reserve`. When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn. A generation that fills `gen_reserve` reswaps the pool (`--kvmem-gen-exceed retrieval`, the default); `--kvmem-gen-exceed error` restores the v1 hard limit.
 
 ## How KVMem attaches to llama.cpp
 
