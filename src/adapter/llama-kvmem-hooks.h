@@ -24,6 +24,7 @@ struct llama_kvmem_params {
     uint32_t sink_tokens;   // 0 → one block
     uint32_t recent_tokens; // 0 → pressure uses newest tail only
     int32_t  method;        // 0 recency, 1 retrieval (CLI default 1)
+    int32_t  prefill_method; // prefill-pressure policy: 0 recency, 1 retrieval (product default 1)
     int32_t  query_begin;   // original token pos, -1 = unset
     int32_t  query_end;     // exclusive, -1 = end of prompt
     int32_t  force_pos;     // include block containing this orig pos; -1 = none
@@ -110,6 +111,10 @@ LLAMA_API bool llama_kvmem_gdn_replay_begin(llama_pos start, uint32_t width);
 LLAMA_API bool llama_kvmem_gdn_replay_commit(struct llama_context * ctx, uint32_t n_keep);
 // Update query span / force_pos on the live memory (after llama_init_from_model).
 LLAMA_API void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos);
+// User-message content spans (rows) of the current prompt, ascending. Used as
+// the retrieval query while a prefill is under pressure and the request query
+// is not prefilled yet. Empty list = prefill pressure stays recency.
+LLAMA_API void llama_kvmem_set_prefill_query_spans(const uint32_t * begins, const uint32_t * ends, size_t count);
 // Compare never-evicted GPU KV vs host-rebuild from raw-K. block_id -1 = force_pos block.
 LLAMA_API void llama_kvmem_dump_kv_compare(struct llama_context * ctx, int32_t block_id);
 LLAMA_API void llama_kvmem_dump_kv_writeback(struct llama_context * ctx, int32_t block_id);

@@ -1128,6 +1128,69 @@ static void test_media_suffix_over_budget() {
     CHECK(threw);
 }
 
+static void test_prefill_pressure_scored_blocks_rank_by_score() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 128;
+    cfg.select_budget = 128 * 6;   // semantic budget = 6 blocks
+    cfg.prefill_budget = 128 * 6;
+    cfg.sink_blocks = 1;
+    cfg.recent_blocks = 1;         // one pinned suffix block, as decode would
+    KvMemStore s(cfg);
+    s.register_append(128 * 12);   // ids 0..11
+
+    // Old middle blocks carry the request intent; the newest tail scores zero.
+    std::vector<double> scores(12, 0.0);
+    scores[2] = 9.0;
+    scores[3] = 8.0;
+    scores[4] = 7.0;
+    s.set_retrieval_scores(scores);
+
+    // sink {0} + mandatory {11} + pinned newest {10} + the three hottest
+    // blocks {2,3,4}.
+    const std::vector<uint32_t> expected{0, 2, 3, 4, 10, 11};
+    CHECK(s.pick_prefill_pressure_scored_blocks({11}) == expected);
+
+    // The recency variant ignores the same scores: sink + newest tail.
+    const std::vector<uint32_t> recency{0, 7, 8, 9, 10, 11};
+    CHECK(s.pick_prefill_pressure_blocks({11}) == recency);
+
+    // Incoming rows are hard requirements for a prefill reselect: {9,10,11}
+    // plus the sink leave room for only the two best-scoring blocks {2,3}.
+    const auto mandatory_kept = s.pick_prefill_pressure_scored_blocks({9, 10, 11});
+    const std::vector<uint32_t> mandatory_expected{0, 2, 3, 9, 10, 11};
+    CHECK(mandatory_kept == mandatory_expected);
+
+    // `recent_blocks` pins the newest suffix for pressure exactly like the
+    // semantic selector: a wider pin takes slots from the scored fill.
+    cfg.recent_blocks = 4;
+    KvMemStore wide_pin(cfg);
+    wide_pin.register_append(128 * 12);
+    wide_pin.set_retrieval_scores(scores);
+    const std::vector<uint32_t> wide_pin_expected{0, 2, 8, 9, 10, 11};
+    CHECK(wide_pin.pick_prefill_pressure_scored_blocks({11}) == wide_pin_expected);
+}
+
+static void test_prefill_pressure_scored_uses_prefill_budget() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 128;
+    cfg.select_budget = 128 * 10;  // semantic budget widens
+    cfg.prefill_budget = 128 * 4;  // pressure contracts to this
+    cfg.sink_blocks = 1;
+    KvMemStore s(cfg);
+    s.register_append(128 * 12);
+
+    std::vector<double> scores(12, 0.0);
+    scores[2] = 9.0;
+    scores[9] = 1.0;
+    s.set_retrieval_scores(scores);
+
+    const auto sel = s.pick_prefill_pressure_scored_blocks({11});
+    CHECK(sel.size() == 4);
+    for (uint32_t id : {0u, 2u, 9u, 11u}) {
+        CHECK(std::find(sel.begin(), sel.end(), id) != sel.end());
+    }
+}
+
 int main() {
     test_media_suffix_over_budget();
     test_media_groups_with_shared_boundary();
@@ -1150,6 +1213,8 @@ int main() {
     test_prefill_pressure_edges();
     test_prefill_watermark_offload_predicate();
     test_prefill_pressure_budget_is_independent_from_semantic_budget();
+    test_prefill_pressure_scored_blocks_rank_by_score();
+    test_prefill_pressure_scored_uses_prefill_budget();
     test_request_semantic_budget_override_is_scoped_and_bounded();
     test_quota_policy_sink_recent_retrieval_profile();
     test_topk_all_fit();

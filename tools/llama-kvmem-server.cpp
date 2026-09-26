@@ -110,9 +110,12 @@ static void print_usage(const char * argv0) {
             "  --kvmem-gen-reserve N      decode slack (default 256)\n"
             "  --kvmem-recent-tokens N    always-kept newest suffix in select budget (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
+            "  --kvmem-prefill-method M   recency | retrieval (default retrieval): prefill pressure policy\n"
             "  --kvmem-query-last N       fallback query-last if last-user span missing (default 64)\n"
             "  --kvmem-query-max-tokens N cap last-user retrieval query to this many tokens\n"
             "                            from the end of the span (default 512; qw3-style)\n"
+            "  --kvmem-prefill-query-max-tokens N  tail of each user span used as the\n"
+            "                            prefill query (default 128)\n"
             "  --kvmem-query-replay MODE  legacy or auto (default auto)\n"
             "  --kvmem-query-policy MODE  legacy or user (default user)\n"
             "  --kvmem-mtp-state MODE     snapshots, auto or replay (default replay with MTP)\n"
@@ -224,6 +227,9 @@ struct ServerState {
     json sampling_overrides = json::object();
     int query_last_fallback = 64;
     int query_max_tokens = 512;
+    // Cap the per-span tail captured for prefill-pressure retrieval. Small
+    // because every crossed user span pays one Q D2H per layer.
+    int prefill_query_max_tokens = 128;
     bool query_replay_auto = true;
     bool query_policy_user = true;
     uint32_t turn_generation_rows = 0;
@@ -1095,6 +1101,57 @@ static void clamp_query_span(const ServerState & st, int & qbegin, int & qend) {
     }
 }
 
+// Every ChatML user-message content span of the rendered prompt, in row order.
+// A long prefill runs out of slots before its request query is prefilled, so
+// the pressure policy scores against the newest user span that is already
+// prefilled. Each span keeps only its last `cap` rows: the tail carries the
+// intent and bounds the Q D2H paid per crossed span.
+static std::vector<llama_kvmem_row_range> collect_user_spans(const ServerState & st,
+                                                            const std::string & formatted,
+                                                            const kvmem_prompt & prompt,
+                                                            int eval_end, int cap) {
+    std::vector<llama_kvmem_row_range> spans;
+    if (cap <= 0 || eval_end <= 0) {
+        return spans;
+    }
+    size_t c0 = 0;
+    size_t c1 = 0;
+    int n_blocks = 0;
+    int pick = -1;
+    if (!find_last_user_role_block(formatted, "", c0, c1, n_blocks, pick) || n_blocks == 0) {
+        return spans;
+    }
+    common_chat_msg_delimiters delimiters;
+    delimiters.add(COMMON_CHAT_ROLE_USER, "<|im_start|>user");
+    delimiters.add(COMMON_CHAT_ROLE_UNKNOWN, "<|im_end|>");
+    delimiters.tokenize(st.vocab);
+    const auto parsed = prompt.message_spans(delimiters);
+    std::vector<common_chat_msg_span> users;
+    for (const auto & span : parsed.spans) {
+        if (span.role == COMMON_CHAT_ROLE_USER) {
+            users.push_back(span);
+        }
+    }
+    // A mismatch means the tokenizer view and the rendered text disagree. Do
+    // not guess; the caller then keeps the recency policy.
+    if ((int) users.size() != n_blocks) {
+        return spans;
+    }
+    const int header = (int) delimiters.delimiters.front().tokens.size();
+    for (const auto & span : users) {
+        int begin = span.pos + header;
+        int end = span.pos + span.len;
+        for (const auto & image : prompt.media_ranges()) {
+            if ((int) image.first >= begin && (int) image.second <= end) begin = image.second;
+        }
+        end = std::min(end, eval_end);
+        if (end - begin > cap) begin = end - cap;
+        if (begin >= end) continue;
+        spans.push_back({begin, end});
+    }
+    return spans;
+}
+
 struct ChatRequest {
     std::vector<common_chat_msg> msgs;
     std::vector<common_chat_tool> tools;
@@ -1554,6 +1611,7 @@ int main(int argc, char ** argv) {
     st.kparams.gen_reserve = 256;
     st.kparams.recent_tokens = 0;
     st.kparams.method = 1;
+    st.kparams.prefill_method = 1;
     st.kparams.enabled = true;
     st.kparams.query_begin = -1;
     st.kparams.query_end = -1;
@@ -1662,6 +1720,20 @@ int main(int argc, char ** argv) {
         } else if (eq(arg, "--kvmem-method")) {
             const char * m = need(arg);
             st.kparams.method = (eq(m, "retrieval") || eq(m, "retrieve")) ? 1 : 0;
+        } else if (eq(arg, "--kvmem-prefill-method")) {
+            const char * m = need(arg);
+            if (!eq(m, "recency") && !eq(m, "retrieval")) {
+                fprintf(stderr, "invalid --kvmem-prefill-method (want recency|retrieval)\n");
+                return 1;
+            }
+            st.kparams.prefill_method = eq(m, "retrieval") ? 1 : 0;
+        } else if (eq(arg, "--kvmem-prefill-query-max-tokens")) {
+            const int v = kvmem_cli_int(arg, need(arg));
+            if (v <= 0) {
+                fprintf(stderr, "invalid --kvmem-prefill-query-max-tokens (want > 0)\n");
+                return 1;
+            }
+            st.prefill_query_max_tokens = v;
         } else if (eq(arg, "--kvmem-query-last")) {
             st.query_last_fallback = kvmem_cli_int(arg, need(arg));
         } else if (eq(arg, "--kvmem-query-replay")) {
@@ -2266,6 +2338,25 @@ int main(int argc, char ** argv) {
         if (st.kparams.enabled) {
             llama_kvmem_set_request_span(qbegin, qend, force);
         }
+        if (st.kparams.enabled && st.kparams.prefill_method == 1) {
+            // Prefill pressure scores against the newest user span that has
+            // already been prefilled. The request query is usually still ahead
+            // of the prefill cursor, so it cannot serve as that query.
+            const int eval_end = (int) toks.size() - (st.spec.ok ? 1 : 0);
+            const auto user_spans = collect_user_spans(st, prompt, *parsed_prompt, eval_end,
+                                                       st.prefill_query_max_tokens);
+            std::vector<uint32_t> span_begin;
+            std::vector<uint32_t> span_end;
+            span_begin.reserve(user_spans.size());
+            span_end.reserve(user_spans.size());
+            for (const auto & s : user_spans) {
+                span_begin.push_back((uint32_t) s.begin);
+                span_end.push_back((uint32_t) s.end);
+            }
+            llama_kvmem_set_prefill_query_spans(span_begin.data(), span_end.data(), span_begin.size());
+            kvmem_diag("KVMEM_TRACE prefill_query_spans n=%zu eval_end=%d cap=%d\n",
+                    user_spans.size(), eval_end, st.prefill_query_max_tokens);
+        }
         int n_tool_hist = 0;
         for (const auto & m : cr.msgs) {
             if (m.role == "tool" || !m.tool_calls.empty()) {
@@ -2741,9 +2832,10 @@ int main(int argc, char ** argv) {
         return 1;
     }
     kvmem_diag("KVMEM_STARTUP ready=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
-    LOG_INF("srv    llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
+    LOG_INF("srv    llama-kvmem-server listening on http://%s:%d  model=%s kvmem=%d method=%s prefill=%s n_ctx=%d spec=%s n_max=%d think=%d rbudget=%d qmax=%d\n",
             host.c_str(), port, st.model_name.c_str(), (int) st.kparams.enabled,
-            st.kparams.method == 1 ? "retrieval" : "recency", n_ctx,
+            st.kparams.method == 1 ? "retrieval" : "recency",
+            st.kparams.prefill_method == 1 ? "retrieval" : "recency", n_ctx,
             st.spec.ok ? "draft-mtp" : "off", st.spec_n_max, (int) st.enable_thinking_default,
             st.reasoning_budget_default, st.query_max_tokens);
     if (!svr.listen_after_bind()) {

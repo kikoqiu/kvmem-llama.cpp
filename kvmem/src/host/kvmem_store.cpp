@@ -351,15 +351,28 @@ bool KvMemStore::prefill_needs_offload(uint32_t resident_tokens,
 }
 
 std::vector<uint32_t> KvMemStore::pick_prefill_pressure_blocks(const std::vector<uint32_t> & mandatory) const {
-    return constrain_media(pick_prefill_ungrouped(mandatory), mandatory, prefill_budget_blocks(), true);
+    return constrain_media(pick_prefill_ungrouped(mandatory), mandatory, prefill_budget_blocks(),
+                           /*score_order=*/false, /*mandatory_required=*/true);
+}
+
+std::vector<uint32_t> KvMemStore::pick_prefill_pressure_scored_blocks(
+        const std::vector<uint32_t> & mandatory) const {
+    const uint32_t budget = prefill_budget_blocks();
+    // Same policy as the semantic selector, so a prefill reselect and the
+    // following decode retrieval agree on the window. `recent_blocks` pins the
+    // newest suffix in both.
+    return constrain_media(pick_scored_ungrouped(mandatory, budget, cfg_.recent_blocks),
+                           mandatory, budget, /*score_order=*/true, /*mandatory_required=*/true);
 }
 
 std::vector<uint32_t> KvMemStore::pick_topk_blocks(const std::vector<uint32_t> & mandatory) const {
-    return constrain_media(pick_topk_ungrouped(mandatory), mandatory, budget_blocks(), false);
+    return constrain_media(pick_topk_ungrouped(mandatory), mandatory, budget_blocks(),
+                           /*score_order=*/true, /*mandatory_required=*/false);
 }
 
 std::vector<uint32_t> KvMemStore::constrain_media(std::vector<uint32_t> selected,
-        const std::vector<uint32_t> & mandatory, uint32_t budget, bool recency) const {
+        const std::vector<uint32_t> & mandatory, uint32_t budget, bool score_order,
+        bool mandatory_required) const {
     const uint32_t n = block_count();
     if (media_ranges_.empty() || n <= budget || budget == 0) return selected;
     std::vector<std::pair<uint32_t, uint32_t>> groups;
@@ -397,9 +410,9 @@ std::vector<uint32_t> KvMemStore::constrain_media(std::vector<uint32_t> selected
     // During prefill these are incoming rows, which must all have slots.
     auto newest = mandatory;
     std::sort(newest.begin(), newest.end(), std::greater<uint32_t>());
-    for (auto id : newest) keep(id, recency);
+    for (auto id : newest) keep(id, mandatory_required);
     auto better = [&](uint32_t a, uint32_t b) {
-        if (!recency && blocks_[a].attn_score != blocks_[b].attn_score) return blocks_[a].attn_score > blocks_[b].attn_score;
+        if (score_order && blocks_[a].attn_score != blocks_[b].attn_score) return blocks_[a].attn_score > blocks_[b].attn_score;
         return a > b;
     };
     std::sort(selected.begin(), selected.end(), better);
@@ -481,11 +494,16 @@ std::vector<uint32_t> KvMemStore::pick_topk_blocks() const {
 
 std::vector<uint32_t> KvMemStore::pick_topk_ungrouped(
         const std::vector<uint32_t> &mandatory_blocks) const {
+    return pick_scored_ungrouped(mandatory_blocks, budget_blocks(), cfg_.recent_blocks);
+}
+
+std::vector<uint32_t> KvMemStore::pick_scored_ungrouped(
+        const std::vector<uint32_t> &mandatory_blocks, uint32_t budget,
+        uint32_t recent_blocks) const {
     const uint32_t n = block_count();
     std::vector<uint32_t> selected;
     if (n == 0) return selected;
 
-    const uint32_t budget = budget_blocks();
     if (budget == 0 || n <= budget) {
         // Everything fits: select all in order.
         selected.reserve(n);
@@ -498,7 +516,7 @@ std::vector<uint32_t> KvMemStore::pick_topk_ungrouped(
     // Zero is literal: do not reserve any suffix blocks.  Earlier versions used
     // zero as an implicit "auto = budget/4", which made a 200K-token budget
     // silently pin 50K tokens and was both surprising and hard to control.
-    const uint32_t recent = std::min(cfg_.recent_blocks, n);
+    const uint32_t recent = std::min(recent_blocks, n);
 
     std::vector<bool> kept(n, false);
     uint32_t kept_count = 0;

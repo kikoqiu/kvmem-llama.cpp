@@ -423,6 +423,14 @@ public:
     std::vector<uint32_t> pick_prefill_pressure_blocks(
         const std::vector<uint32_t> &mandatory_blocks) const;
 
+    // Prefill pressure that ranks by the caller's retrieval scores instead of
+    // recency. Used when a query for the text already prefilled exists, so the
+    // prefill window matches what the decode side would select. Same policy as
+    // the semantic selector (sink, mandatory, `recent_blocks` pin, then score),
+    // but bounded by the prefill budget.
+    std::vector<uint32_t> pick_prefill_pressure_scored_blocks(
+        const std::vector<uint32_t> &mandatory_blocks) const;
+
     // Accumulate per-block attention quality (decode side-channel, #40). `scores`
     // is indexed by block_id; entries beyond block_count() are ignored.
     void accumulate_attn(const std::vector<double> &scores);
@@ -473,7 +481,11 @@ public:
 
 private:
     std::vector<uint32_t> constrain_media(std::vector<uint32_t> selected,
-        const std::vector<uint32_t> & mandatory, uint32_t budget, bool recency) const;
+        const std::vector<uint32_t> & mandatory, uint32_t budget, bool score_order,
+        bool mandatory_required) const;
+    // Shared scored fill: sink + mandatory (+ optional recent pin) + top score.
+    std::vector<uint32_t> pick_scored_ungrouped(const std::vector<uint32_t> & mandatory,
+        uint32_t budget, uint32_t recent_blocks) const;
     std::vector<uint32_t> pick_topk_ungrouped(const std::vector<uint32_t> & mandatory) const;
     std::vector<uint32_t> pick_prefill_ungrouped(const std::vector<uint32_t> & mandatory) const;
     std::vector<std::pair<uint32_t, uint32_t>> media_ranges_;

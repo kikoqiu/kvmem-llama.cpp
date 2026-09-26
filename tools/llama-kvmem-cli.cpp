@@ -34,6 +34,8 @@ static void print_usage(const char * argv0) {
             "  --kvmem-sink-tokens N      always-kept prefix; 0 = one block\n"
             "  --kvmem-recent-tokens N    always-kept suffix blocks (default 0)\n"
             "  --kvmem-method NAME        recency | retrieval (default retrieval)\n"
+            "  --kvmem-prefill-method M   recency | retrieval (default retrieval); needs user\n"
+            "                             role spans, which only llama-kvmem-server knows\n"
             "  --kvmem-query-last N       last N prompt tokens are the retrieval query (default 64)\n"
             "  --kvmem-force-substr S     force-select the block containing substring S\n"
             "  --kvmem-gpu-ratio R        cap slot pool at this fraction of GPU VRAM (default 0.50)\n"
@@ -79,6 +81,7 @@ int main(int argc, char ** argv) {
     kparams.block_tokens = 32;
     kparams.gen_reserve = 256;
     kparams.method = 1;  // retrieval
+    kparams.prefill_method = 1;  // retrieval
     kparams.query_begin = -1;
     kparams.query_end = -1;
     kparams.force_pos = -1;
@@ -146,6 +149,13 @@ int main(int argc, char ** argv) {
                 kparams.method = 1;
             } else {
                 kparams.method = 0;
+            }
+        } else if (eq(arg, "--kvmem-prefill-method")) {
+            const char * m = need(arg);
+            if (eq(m, "retrieval") || eq(m, "retrieve")) {
+                kparams.prefill_method = 1;
+            } else {
+                kparams.prefill_method = 0;
             }
         } else if (eq(arg, "--kvmem-query-last")) {
             query_last = std::atoi(need(arg));

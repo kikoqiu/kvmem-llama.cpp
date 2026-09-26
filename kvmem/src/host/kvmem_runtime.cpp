@@ -120,9 +120,10 @@ bool KvMemRuntime::commit_resident_selection(const std::vector<uint32_t> & selec
 }
 
 KvMemPlan KvMemRuntime::prepare_prefill_pressure(
-        const std::vector<uint32_t> &mandatory) {
+        const std::vector<uint32_t> &mandatory, bool scored) {
     last_plan_ = store_.set_selection(
-        store_.pick_prefill_pressure_blocks(mandatory));
+        scored ? store_.pick_prefill_pressure_scored_blocks(mandatory)
+               : store_.pick_prefill_pressure_blocks(mandatory));
     pending_ = true;
     start_prefetch();
     return last_plan_;
@@ -132,11 +133,12 @@ bool KvMemRuntime::maybe_offload_during_prefill(
         uint32_t incoming_tokens,
         uint32_t resident_tokens,
         uint32_t pool_tokens,
-        const std::vector<uint32_t> &mandatory) {
+        const std::vector<uint32_t> &mandatory,
+        bool scored) {
     if (!store_.prefill_needs_offload(resident_tokens, incoming_tokens, pool_tokens)) {
         return false;
     }
-    prepare_prefill_pressure(mandatory);
+    prepare_prefill_pressure(mandatory, scored);
     return true;
 }
 

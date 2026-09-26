@@ -548,6 +548,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     type_v_ = params.type_v;
     v_trans_ = !cparams.flash_attn;
     method_ = g_kvmem_params.method;
+    prefill_method_ = g_kvmem_params.prefill_method;
     query_begin_ = g_kvmem_params.query_begin;
     query_end_ = g_kvmem_params.query_end;
     force_pos_ = g_kvmem_params.force_pos;
@@ -575,6 +576,8 @@ llama_memory_kvmem::llama_memory_kvmem(
     raw_ = std::make_unique<kvmem::RawKvStore>(rcfg);
     q_sum_.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
     q_count_.assign(n_layer_, 0);
+    q_pre_sum_.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
+    q_pre_count_.assign(n_layer_, 0);
     kvmem_capture_bind(this);
 
     size_t kv_bytes = 0;
@@ -584,10 +587,11 @@ llama_memory_kvmem::llama_memory_kvmem(
         }
     }
     LLAMA_LOG_INFO(
-            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s\n",
+            "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s prefill=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s\n",
             __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
             rt_cfg.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
+            prefill_method_ == 1 ? "retrieval" : "recency",
             (int) g_kvmem_params.harvest_v,
             ggml_type_name(type_k_), ggml_type_name(type_v_),
             n_embd_k_, kvmem_n_attn_layers(model),
@@ -1282,14 +1286,47 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
 
     const uint32_t budget_blocks = store.prefill_budget_blocks();
     bool need_offload = false;
+    bool scored = false;
     // After retrieval the host store still holds every historical block, so
     // block_count() > budget is true and a recency pressure reselect would
     // drop the resurrected needle on the first generated token. Pin the
     // working set and place decode tokens into gen_reserve slots.
     if (!retrieval_pinned_ && !keep_selected_) {
+        // With --kvmem-prefill-method retrieval the pressure window follows the
+        // request query instead of recency. The query itself is usually still
+        // ahead of the prefill cursor, so the newest user span that has already
+        // been prefilled stands in for it. No such span means no query: keep
+        // the recency policy.
+        if (prefill_method_ == 1 && method_ == 1) {
+            const uint32_t pre_rows = prefill_query_rows();
+            if (pre_rows > 0 && store.prefill_needs_offload(resident_tokens(), n_new_tokens, kv_size_)) {
+                if (pre_rows != prefill_score_rows_) {
+                    try {
+                        harvest_flush();
+                        score_retrieval(q_pre_sum_, q_pre_count_);
+                        prefill_score_rows_ = pre_rows;
+                    } catch (const std::exception & e) {
+                        LLAMA_LOG_ERROR("%s: KVMem prefill score failed: %s\n", __func__, e.what());
+                        runtime_->truncate_to(t0);
+                        return false;
+                    }
+                }
+                scored = true;
+            }
+        }
+        std::vector<uint32_t> mandatory = incoming;
+        if (scored) {
+            // The query span belongs to this turn. A pressure reselect must not
+            // evict the rows that were just scored.
+            for (uint32_t id : retrieval_mandatory()) {
+                mandatory.push_back(id);
+            }
+            std::sort(mandatory.begin(), mandatory.end());
+            mandatory.erase(std::unique(mandatory.begin(), mandatory.end()), mandatory.end());
+        }
         try {
             need_offload = runtime_->maybe_offload_during_prefill(
-                    n_new_tokens, resident_tokens(), kv_size_, incoming);
+                    n_new_tokens, resident_tokens(), kv_size_, mandatory, scored);
         } catch (const std::exception & e) {
             LLAMA_LOG_ERROR("%s: KVMem reselect failed: %s\n", __func__, e.what());
             runtime_->truncate_to(t0);
@@ -1298,11 +1335,13 @@ bool llama_memory_kvmem::prepare_working_set(uint32_t n_new_tokens) {
     }
 
     if (trace_) {
+        const bool pressure_open = !retrieval_pinned_ && !keep_selected_;
         kvmem_diag("KVMEM_TRACE append n=%u total=%u resident=%u incoming_blocks=%zu "
-                "over_budget=%d need_offload=%d free_slots=%zu\n",
+                "over_budget=%d need_offload=%d policy=%s q_rows=%u spans=%zu free_slots=%zu\n",
                 n_new_tokens, t1, resident_tokens(), incoming.size(),
                 (int) (store.block_count() > budget_blocks), (int) need_offload,
-                free_slots_.size());
+                !pressure_open ? "pinned" : (scored ? "retrieval" : "recency"),
+                prefill_query_rows(), prefill_spans_.size(), free_slots_.size());
     }
 
     if (need_offload) {
@@ -2067,6 +2106,12 @@ void llama_memory_kvmem::reset_query_acc() {
         std::fill(s.begin(), s.end(), 0.0f);
     }
     std::fill(q_count_.begin(), q_count_.end(), 0);
+    for (auto & s : q_pre_sum_) {
+        std::fill(s.begin(), s.end(), 0.0f);
+    }
+    std::fill(q_pre_count_.begin(), q_pre_count_.end(), 0);
+    prefill_span_ = -1;
+    prefill_score_rows_ = 0;
 }
 
 void llama_memory_kvmem::bytes_to_f32_token_major(const uint8_t * data, ggml_type type,
@@ -2168,13 +2213,7 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
             return;
         }
         for (uint32_t i = 0; i < n; ++i) {
-            if (!query_contains(cur_pos_[i])) continue;
-            float * dst = q_sum_[static_cast<uint32_t>(il)].data();
-            const float * src = flat.data() + i * qdim;
-            for (uint32_t d0 = 0; d0 < qdim; ++d0) {
-                dst[d0] += src[d0];
-            }
-            q_count_[static_cast<uint32_t>(il)]++;
+            accumulate_query_row(static_cast<uint32_t>(il), flat.data() + i * qdim, qdim, cur_pos_[i]);
         }
     }
 }
@@ -2215,13 +2254,7 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
             return;
         }
         for (uint32_t i = 0; i < n; ++i) {
-            if (!query_contains(cur_pos_[i])) continue;
-            float * dst = q_sum_[static_cast<uint32_t>(il)].data();
-            const float * src = flat.data() + i * qdim;
-            for (uint32_t d = 0; d < qdim; ++d) {
-                dst[d] += src[d];
-            }
-            q_count_[static_cast<uint32_t>(il)]++;
+            accumulate_query_row(static_cast<uint32_t>(il), flat.data() + i * qdim, qdim, cur_pos_[i]);
         }
     }
 }
@@ -2873,6 +2906,11 @@ void llama_memory_kvmem::copy_gpu_block_from_host(uint32_t block_id, int32_t gpu
 }
 
 void llama_memory_kvmem::score_retrieval() {
+    score_retrieval(q_sum_, q_count_);
+}
+
+void llama_memory_kvmem::score_retrieval(const std::vector<std::vector<float>> & q_sum,
+                                         const std::vector<uint32_t> & q_count) {
     auto & store = runtime_->store();
     const uint32_t nblk = store.block_count();
     std::vector<double> scores(nblk, 0.0);
@@ -2885,12 +2923,12 @@ void llama_memory_kvmem::score_retrieval() {
         double acc = 0;
         uint32_t nlay = 0;
         for (uint32_t il = 0; il < n_layer_; ++il) {
-            if (q_count_[il] == 0) {
+            if (q_count[il] == 0) {
                 continue;
             }
             raw_->mean_k(b, il, mk.data());
             double layer = 0;
-            const float invq = 1.0f / static_cast<float>(q_count_[il] * std::max(1u, g));
+            const float invq = 1.0f / static_cast<float>(q_count[il] * std::max(1u, g));
             for (uint32_t h = 0; h < n_head_kv_; ++h) {
                 std::vector<float> qh(n_embd_head_, 0.0f);
                 for (uint32_t gi = 0; gi < g; ++gi) {
@@ -2898,7 +2936,7 @@ void llama_memory_kvmem::score_retrieval() {
                     if (qh_i >= n_head_) {
                         break;
                     }
-                    const float * q = q_sum_[il].data() + qh_i * n_embd_head_;
+                    const float * q = q_sum[il].data() + qh_i * n_embd_head_;
                     for (uint32_t d = 0; d < n_embd_head_; ++d) {
                         qh[d] += q[d];
                     }
@@ -2960,10 +2998,95 @@ bool llama_memory_kvmem::query_contains(llama_pos row) const {
     return false;
 }
 
+void llama_memory_kvmem::set_prefill_query_spans(const std::vector<llama_kvmem_row_range> & spans) {
+    prefill_spans_.clear();
+    for (const auto & r : spans) {
+        if (r.begin < 0 || r.end < r.begin) {
+            throw std::invalid_argument("invalid KVMem prefill query span");
+        }
+        if (r.end <= r.begin) {
+            continue;
+        }
+        if (!prefill_spans_.empty() && r.begin < prefill_spans_.back().end) {
+            throw std::invalid_argument("KVMem prefill query spans must be ascending and disjoint");
+        }
+        prefill_spans_.push_back(r);
+    }
+    if (trace_) {
+        kvmem_diag("KVMEM_TRACE prefill_spans method=%d n=%zu first=[%d,%d) last=[%d,%d)\n",
+                prefill_method_, prefill_spans_.size(),
+                prefill_spans_.empty() ? -1 : prefill_spans_.front().begin,
+                prefill_spans_.empty() ? -1 : prefill_spans_.front().end,
+                prefill_spans_.empty() ? -1 : prefill_spans_.back().begin,
+                prefill_spans_.empty() ? -1 : prefill_spans_.back().end);
+    }
+    reset_prefill_acc(-1);
+}
+
+void llama_memory_kvmem::reset_prefill_acc(int32_t span_ix) {
+    for (auto & s : q_pre_sum_) {
+        std::fill(s.begin(), s.end(), 0.0f);
+    }
+    std::fill(q_pre_count_.begin(), q_pre_count_.end(), 0);
+    prefill_span_ = span_ix;
+    prefill_score_rows_ = 0;
+}
+
+bool llama_memory_kvmem::prefill_query_contains(llama_pos row, int32_t * span_ix) const {
+    for (size_t i = 0; i < prefill_spans_.size(); ++i) {
+        const auto & r = prefill_spans_[i];
+        if (row < r.begin) {
+            break;
+        }
+        if (row < r.end) {
+            if (span_ix) *span_ix = static_cast<int32_t>(i);
+            return true;
+        }
+    }
+    return false;
+}
+
+uint32_t llama_memory_kvmem::prefill_query_rows() const {
+    uint32_t rows = 0;
+    for (uint32_t il = 0; il < n_layer_; ++il) {
+        rows = std::max(rows, q_pre_count_[il]);
+    }
+    return rows;
+}
+
+void llama_memory_kvmem::accumulate_query_row(uint32_t il, const float * src, uint32_t qdim, llama_pos row) {
+    if (il >= n_layer_ || !src) {
+        return;
+    }
+    const bool in_query = query_contains(row);
+    int32_t span_ix = -1;
+    const bool in_prefill = has_prefill_query() && prefill_query_contains(row, &span_ix);
+    if (!in_query && !in_prefill) {
+        return;
+    }
+    if (in_query) {
+        float * dst = q_sum_[il].data();
+        for (uint32_t d = 0; d < qdim; ++d) dst[d] += src[d];
+        q_count_[il]++;
+    }
+    if (in_prefill) {
+        // A later user span replaces the pressure query. Drop the older rows
+        // so the mean never mixes two user messages.
+        if (span_ix != prefill_span_) {
+            reset_prefill_acc(span_ix);
+        }
+        float * dst = q_pre_sum_[il].data();
+        for (uint32_t d = 0; d < qdim; ++d) dst[d] += src[d];
+        q_pre_count_[il]++;
+    }
+}
+
 bool llama_memory_kvmem::query_overlaps(uint32_t n, const llama_pos * rows) const {
     if (!want_q_capture() || !n) return false;
     if (!rows) return true;
     for (uint32_t i = 0; i < n; ++i) if (query_contains(rows[i])) return true;
+    if (!has_prefill_query()) return false;
+    for (uint32_t i = 0; i < n; ++i) if (prefill_query_contains(rows[i], nullptr)) return true;
     return false;
 }
 
@@ -3773,6 +3896,17 @@ void llama_kvmem_set_media_ranges(const uint32_t * starts, const uint32_t * ends
         std::vector<std::pair<uint32_t, uint32_t>> ranges;
         for (size_t i = 0; i < count; ++i) ranges.emplace_back(starts[i], ends[i]);
         mem->runtime().store().set_media_ranges(std::move(ranges));
+    }
+}
+
+void llama_kvmem_set_prefill_query_spans(const uint32_t * begins, const uint32_t * ends, size_t count) {
+    if (auto * mem = kvmem_capture_active()) {
+        std::vector<llama_kvmem_row_range> spans;
+        spans.reserve(count);
+        for (size_t i = 0; i < count; ++i) {
+            spans.push_back({static_cast<int32_t>(begins[i]), static_cast<int32_t>(ends[i])});
+        }
+        mem->set_prefill_query_spans(spans);
     }
 }
 

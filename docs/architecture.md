@@ -35,6 +35,26 @@ Hardware split on this machine: RTX 5050 (GPU 0) for models < 27B;
 RTX 5090 (GPU 1) for 27B. Details in `scripts/gpu.sh` and
 `docs/modification-plan.md`.
 
+## Prefill pressure policy
+
+A prefill longer than the pool evicts while it is still running. The recency
+policy keeps the sink prefix, then fills the prefill budget with the newest
+blocks. Decode-time retrieval then re-selects with the request query, so the two
+stages can disagree and a re-prefilled context lands on a different resident set
+than the same context served from a live window.
+
+`--kvmem-prefill-method retrieval` (the server default) makes the prefill
+pressure use the same scored selection as decode: sink, incoming rows, the
+`--kvmem-recent-tokens` suffix pin, then the best-scoring blocks. The request
+query is normally still ahead of the prefill cursor, so the newest
+user-message span that has already been prefilled stands in for it.
+`llama-kvmem-server` passes every user span of the rendered prompt
+(`--kvmem-prefill-query-max-tokens`, default 128, keeps only each span tail);
+the adapter scores blocks against the mean-Q of that span and reselects inside
+the prefill budget, keeping the request query span mandatory. No user span yet
+(system prompt, first message) means no query, and the policy stays recency.
+Raw completion and the CLI have no chat roles, so they keep recency.
+
 ## Known v1 limit: generation length vs `gen_reserve`
 
 GPU pool = `budget` (selected working set) + `gen_reserve` (decode slack).

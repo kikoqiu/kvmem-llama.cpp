@@ -102,6 +102,15 @@ public:
     void harvest_capture(struct ggml_tensor * t, int il, char which);
     void apply_retrieval();
     void set_turn_spans(const llama_kvmem_turn_spans & spans);
+    // User-message spans of the prompt being prefilled. While a prefill is
+    // under pressure the newest already-started span stands in for the request
+    // query, which is usually not prefilled yet.
+    void set_prefill_query_spans(const std::vector<llama_kvmem_row_range> & spans);
+    bool prefill_query_contains(llama_pos row, int32_t * span_ix) const;
+    uint32_t prefill_query_rows() const;
+    void reset_prefill_acc(int32_t span_ix);
+    void accumulate_query_row(uint32_t il, const float * src, uint32_t qdim, llama_pos row);
+    bool has_prefill_query() const { return prefill_method_ == 1 && !prefill_spans_.empty(); }
     bool query_contains(llama_pos row) const;
     bool query_overlaps(uint32_t n, const llama_pos * rows) const;
     llama_kvmem_attention_view attention_view(bool canonical = true) const;
@@ -246,6 +255,8 @@ private:
     void copy_gpu_block_from_host(uint32_t block_id, int32_t gpu_slot,
                                   const void * host, uint64_t bytes);
     void score_retrieval();
+    void score_retrieval(const std::vector<std::vector<float>> & q_sum,
+                         const std::vector<uint32_t> & q_count);
     bool read_gpu_block(uint32_t block_id, uint32_t il, bool is_k, std::vector<float> & out) const;
     static void kv_stats(const char * tag, const float * a, const float * b, size_t n);
     static void tensor_to_f32_token_major(const struct ggml_tensor * t, std::vector<float> & out);
@@ -369,6 +380,7 @@ private:
     bool keep_selected_ = false;
     bool prefill_capture_ = true;
     int32_t method_ = 0;
+    int32_t prefill_method_ = 0;
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
     int32_t force_pos_ = -1;
@@ -422,6 +434,13 @@ private:
     RetrPerf retr_;
     std::vector<std::vector<float>> q_sum_;
     std::vector<uint32_t> q_count_;
+    // Prefill-pressure query: the newest user span that has started prefill.
+    // Reset on every span change, so it never mixes two user messages.
+    std::vector<std::vector<float>> q_pre_sum_;
+    std::vector<uint32_t> q_pre_count_;
+    std::vector<llama_kvmem_row_range> prefill_spans_;
+    uint32_t prefill_score_rows_ = 0;
+    int32_t prefill_span_ = -1;
 };
 
 // GPU attn-cache cell count for a KVMem slot pool (budget + gen_reserve,

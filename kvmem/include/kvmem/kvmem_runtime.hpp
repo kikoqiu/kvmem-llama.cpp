@@ -48,16 +48,19 @@ public:
     KvMemPlan prepare_selection(const std::vector<uint32_t> & selected, bool force_raw_refresh = false);
     bool commit_resident_selection(const std::vector<uint32_t> & selected);
     KvMemPlan prepare_prefill_pressure(
-        const std::vector<uint32_t> &mandatory = {});
+        const std::vector<uint32_t> &mandatory = {},
+        bool scored = false);
 
     // If the next prefill chunk would overflow the semantic budget, the hard
     // GPU pool, or the high watermark, build a sink+tail pressure plan.
     // Does not apply it; caller runs finish_reselect (evict-before-stage-in).
+    // `scored` selects by the caller's retrieval scores instead of recency.
     bool maybe_offload_during_prefill(
         uint32_t incoming_tokens,
         uint32_t resident_tokens,
         uint32_t pool_tokens,
-        const std::vector<uint32_t> &mandatory = {});
+        const std::vector<uint32_t> &mandatory = {},
+        bool scored = false);
 
     // Copy outgoing GPU blocks to CPU/NVMe. Does not free GPU slots yet so
     // the adapter can seq_rm the cells afterwards.
