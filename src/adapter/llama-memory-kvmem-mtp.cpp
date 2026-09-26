@@ -420,84 +420,47 @@ bool llama_memory_kvmem_mtp::layout_d2d(const LayoutMove * moves, size_t n_moves
     }
     const size_t krow = ggml_row_size(type_k_, n_embd_k_);
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
-    const uint64_t kspan = (uint64_t) block_tokens_ * krow;
-    const uint64_t vspan = (uint64_t) block_tokens_ * vrow;
-    const uint64_t stride = kspan + vspan;
-    uint8_t * scratch = nullptr;
-    const size_t scratch_bytes = n_moves * (size_t) stride;
-    const cudaError_t alloc_error = cudaMalloc(reinterpret_cast<void **>(&scratch), scratch_bytes);
-    if (alloc_error != cudaSuccess) {
-        if (alloc_error == cudaErrorMemoryAllocation) {
-            // The caller restores packed host KV; do not leak this handled OOM to the next kernel.
-            (void) cudaGetLastError();
-            LLAMA_LOG_WARN("%s: %zu-byte layout scratch unavailable; using host KV fallback\n",
-                           __func__, scratch_bytes);
+    const uint64_t stride = (uint64_t) block_tokens_ * (krow + vrow);
+    std::vector<kvmem_layout_move> plan;
+    plan.reserve(n_moves);
+    for (size_t i = 0; i < n_moves; ++i) {
+        if (moves[i].n_tokens == 0 || moves[i].src_slot < 0 || moves[i].dst_slot < 0) {
+            continue;
         }
-        return false;
+        plan.push_back({(uint32_t) moves[i].src_slot, (uint32_t) moves[i].dst_slot,
+                        moves[i].n_tokens});
+    }
+    size_t scratch_blocks = kvmem_layout_scratch_blocks(plan.data(), plan.size(), (size_t) stride);
+    uint8_t * scratch = nullptr;
+    if (scratch_blocks) {
+        const cudaError_t alloc_error = cudaMalloc(reinterpret_cast<void **>(&scratch),
+                                                   scratch_blocks * stride);
+        if (alloc_error != cudaSuccess) {
+            if (alloc_error == cudaErrorMemoryAllocation) {
+                // The caller restores packed host KV; do not leak this handled OOM to the next kernel.
+                (void) cudaGetLastError();
+            }
+            scratch = nullptr;
+        }
+        if (!scratch && kvmem_layout_bounded_enabled() && stride > 0 &&
+            cudaMalloc(reinterpret_cast<void **>(&scratch), (size_t) stride) == cudaSuccess) {
+            // One spare block covers the moves that cannot be ordered.
+            scratch_blocks = 1;
+        }
+        if (!scratch) {
+            LLAMA_LOG_WARN("%s: %zu-byte layout scratch unavailable; using host KV fallback\n",
+                           __func__, (size_t) (scratch_blocks * stride));
+            return false;
+        }
     }
     kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
                             std::max(krow, vrow) * (size_t) block_tokens_);
-    std::vector<const void *> gsrc;
-    std::vector<void *> gdst;
-    std::vector<size_t> gbytes;
-    std::vector<const void *> ssrc;
-    std::vector<void *> sdst;
-    std::vector<size_t> sbytes;
-    gsrc.reserve(n_moves * 2);
-    gdst.reserve(n_moves * 2);
-    gbytes.reserve(n_moves * 2);
-    ssrc.reserve(n_moves * 2);
-    sdst.reserve(n_moves * 2);
-    sbytes.reserve(n_moves * 2);
-    for (size_t i = 0; i < n_moves; ++i) {
-        const uint32_t nt = moves[i].n_tokens;
-        if (nt == 0 || moves[i].src_slot < 0 || moves[i].dst_slot < 0) {
-            continue;
-        }
-        const uint32_t src0 = (uint32_t) moves[i].src_slot * block_tokens_;
-        const uint32_t dst0 = (uint32_t) moves[i].dst_slot * block_tokens_;
-        uint8_t * slot_sc = scratch + i * (size_t) stride;
-        if (kbase && krow) {
-            const size_t nb = (size_t) nt * krow;
-            gsrc.push_back(kbase + (size_t) src0 * krow);
-            gdst.push_back(slot_sc);
-            gbytes.push_back(nb);
-            ssrc.push_back(slot_sc);
-            sdst.push_back(kbase + (size_t) dst0 * krow);
-            sbytes.push_back(nb);
-        }
-        if (vbase && vrow) {
-            const size_t nb = (size_t) nt * vrow;
-            gsrc.push_back(vbase + (size_t) src0 * vrow);
-            gdst.push_back(slot_sc + (size_t) kspan);
-            gbytes.push_back(nb);
-            ssrc.push_back(slot_sc + (size_t) kspan);
-            sdst.push_back(vbase + (size_t) dst0 * vrow);
-            sbytes.push_back(nb);
-        }
+    const bool ok = kvmem_layout_apply(kbase, vbase, krow, vrow, block_tokens_,
+                                       plan.data(), plan.size(), scratch, (size_t) stride,
+                                       scratch_blocks);
+    if (scratch) {
+        cudaFree(scratch);
     }
-    bool ok = true;
-    const int ng = (int) gsrc.size();
-    if (ng > 0 && !kvmem_d2d_batched(gsrc.data(), gdst.data(), gbytes.data(), ng)) {
-        for (int j = 0; j < ng && ok; ++j) {
-            ok = kvmem_copy_async(gdst[j], gsrc[j], gbytes[j],
-                                 cudaMemcpyDeviceToDevice) == cudaSuccess;
-        }
-    }
-    if (ok && cudaDeviceSynchronize() != cudaSuccess) {
-        ok = false;
-    }
-    const int ns = (int) ssrc.size();
-    if (ok && ns > 0 && !kvmem_d2d_batched(ssrc.data(), sdst.data(), sbytes.data(), ns)) {
-        for (int j = 0; j < ns && ok; ++j) {
-            ok = kvmem_copy_async(sdst[j], ssrc[j], sbytes[j],
-                                 cudaMemcpyDeviceToDevice) == cudaSuccess;
-        }
-    }
-    if (ok && cudaDeviceSynchronize() != cudaSuccess) {
-        ok = false;
-    }
-    cudaFree(scratch);
     return ok;
 }
 

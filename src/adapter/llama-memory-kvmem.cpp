@@ -204,11 +204,14 @@ static uint8_t * kvmem_cuda_tensor_ptr(ggml_tensor * t) {
     return static_cast<uint8_t *>(t->data);
 }
 
-static bool kvmem_d2d(uint8_t * dst, const uint8_t * src, size_t n, cudaStream_t st) {
-    if (!dst || !src || n == 0) {
-        return true;
+// A handled OOM must not leak into the next CUDA call.
+static uint8_t * kvmem_try_alloc(size_t bytes) {
+    uint8_t * ptr = nullptr;
+    if (bytes == 0 || cudaMalloc(reinterpret_cast<void **>(&ptr), bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return nullptr;
     }
-    return kvmem_cuda_ok(kvmem_copy_async(dst, src, n, cudaMemcpyDeviceToDevice, st), "layout D2D");
+    return ptr;
 }
 
 static void kvmem_stagein_flush_sync(int64_t * copy_us, int64_t * rope_us,
@@ -224,6 +227,28 @@ static void kvmem_stagein_flush_sync(int64_t * copy_us, int64_t * rope_us,
 static bool kvmem_harvest_sync_old() {
     const char * e = getenv("KVMEM_HARVEST_SYNC");
     return e && e[0] != '\0' && e[0] != '0';
+}
+
+// Temp-buffer policy under VRAM pressure. Defaults are the new behavior; each
+// knob can restore the old all-or-nothing allocation for A/B runs:
+//   KVMEM_TEMP_BUDGET_MB  card VRAM kept out of the pool cap (default 512)
+//   KVMEM_STAGING_TRIM=0  keep an oversized D2H staging pair when VRAM is tight
+static uint64_t kvmem_env_mb(const char * name, uint64_t fallback_mb) {
+    const char * e = getenv(name);
+    if (!e || !e[0]) {
+        return fallback_mb * 1024 * 1024;
+    }
+    return static_cast<uint64_t>(strtoull(e, nullptr, 10)) * 1024 * 1024;
+}
+
+static bool kvmem_env_flag(const char * name) {
+    const char * e = getenv(name);
+    return !(e && e[0] == '0');
+}
+
+static uint64_t kvmem_vram_reserve_bytes() {
+    static const uint64_t v = kvmem_env_mb("KVMEM_TEMP_BUDGET_MB", 512);
+    return v;
 }
 
 // Host-wait for the graph at the end of the harvest. Parks the compute thread
@@ -402,8 +427,14 @@ static kvmem_pool_plan kvmem_compute_pool(
     const double ratio = kvmem_default_ratio(g_kvmem_params.gpu_memory_ratio, 0.50);
     p.gpu_total = kvmem_first_gpu_total_bytes();
     if (p.gpu_total > 0 && p.block_bytes > 0 && ratio > 0.0) {
-        p.cap_blocks = static_cast<uint32_t>(
-                (p.gpu_total * ratio) / std::max(p.block_bytes, uint64_t{1}));
+        // This cap only sees total VRAM. Harvest staging and the layout scratch
+        // come out of the same card, so keep a budget for them here.
+        uint64_t usable = static_cast<uint64_t>(p.gpu_total * ratio);
+        const uint64_t reserve = kvmem_vram_reserve_bytes();
+        if (reserve > 0 && reserve < usable) {
+            usable -= reserve;
+        }
+        p.cap_blocks = static_cast<uint32_t>(usable / std::max(p.block_bytes, uint64_t{1}));
     }
 
     uint32_t pool = budget + gen_reserve;
@@ -999,34 +1030,43 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
     const uint64_t vspan = static_cast<uint64_t>(block_tokens_) * vrow;
     const uint64_t scratch_stride = kspan + vspan;
 
-    std::vector<size_t> res_ix(items.size(), static_cast<size_t>(-1));
+    std::vector<kvmem_layout_move> moves;
+    moves.reserve(items.size());
     size_t n_res = 0;
     for (size_t i = 0; i < items.size(); ++i) {
-        if (items[i].resident) {
-            res_ix[i] = n_res++;
+        if (!items[i].resident) {
+            continue;
         }
+        ++n_res;
+        moves.push_back({static_cast<uint32_t>(items[i].slot), static_cast<uint32_t>(i), items[i].n});
     }
 
+    // Free the harvest staging before asking for layout scratch.
+    d2h_trim_idle();
+    size_t scratch_blocks = kvmem_layout_scratch_blocks(moves.data(), moves.size(), scratch_stride);
     bool d2d_ok = n_res > 0;
-    uint8_t * scratch = nullptr;
+    uint8_t * scratch = scratch_blocks ? kvmem_try_alloc(scratch_blocks * scratch_stride) : nullptr;
+    if (scratch_blocks && !scratch && kvmem_layout_bounded_enabled()) {
+        // One spare block is enough for the moves that cannot be ordered.
+        scratch_blocks = 1;
+        scratch = kvmem_try_alloc(scratch_stride);
+    }
+    if (scratch_blocks && !scratch) {
+        scratch_blocks = 0;
+        d2d_ok = false;
+        LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
+    }
     if (d2d_ok) {
-        const cudaError_t alloc_error = cudaMalloc(reinterpret_cast<void **>(&scratch),
-                                                   static_cast<size_t>(n_res) * scratch_stride);
-        if (alloc_error != cudaSuccess) {
-            if (alloc_error == cudaErrorMemoryAllocation) {
-                // Host fallback handles this allocation failure before any layout copies start.
-                (void) cudaGetLastError();
-            }
-            scratch = nullptr;
-            d2d_ok = false;
-            LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
+        if (trace_) {
+            kvmem_diag("KVMEM_TRACE layout_scratch moves=%zu staged=%zu blocks=%zu stride=%zu\n",
+                       moves.size(), kvmem_layout_staged(moves.data(), moves.size()),
+                       scratch_blocks, static_cast<size_t>(scratch_stride));
         }
         kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
                                 std::max(krow, vrow) * (size_t) block_tokens_);
     }
 
     if (d2d_ok) {
-        cudaStream_t st = cudaStreamPerThread;
         bool copy_ok = true;
         for (uint32_t il = 0; il < n_layer_ && copy_ok; ++il) {
             if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
@@ -1044,76 +1084,12 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
                 copy_ok = false;
                 break;
             }
-            std::vector<const void *> gsrc;
-            std::vector<void *> gdst;
-            std::vector<size_t> gbytes;
-            std::vector<const void *> ssrc;
-            std::vector<void *> sdst;
-            std::vector<size_t> sbytes;
-            gsrc.reserve(n_res * 2);
-            gdst.reserve(n_res * 2);
-            gbytes.reserve(n_res * 2);
-            ssrc.reserve(n_res * 2);
-            sdst.reserve(n_res * 2);
-            sbytes.reserve(n_res * 2);
-            for (size_t i = 0; i < items.size(); ++i) {
-                if (res_ix[i] == static_cast<size_t>(-1)) {
-                    continue;
-                }
-                const uint32_t nt = items[i].n;
-                const uint32_t src0 = static_cast<uint32_t>(items[i].slot) * block_tokens_;
-                const uint32_t dst0 = static_cast<uint32_t>(i) * block_tokens_;
-                uint8_t * slot_sc = scratch + res_ix[i] * scratch_stride;
-                if (kbase && krow && nt) {
-                    const size_t nb = static_cast<size_t>(nt) * krow;
-                    gsrc.push_back(kbase + static_cast<size_t>(src0) * krow);
-                    gdst.push_back(slot_sc);
-                    gbytes.push_back(nb);
-                    ssrc.push_back(slot_sc);
-                    sdst.push_back(kbase + static_cast<size_t>(dst0) * krow);
-                    sbytes.push_back(nb);
-                }
-                if (vbase && vrow && nt) {
-                    const size_t nb = static_cast<size_t>(nt) * vrow;
-                    gsrc.push_back(vbase + static_cast<size_t>(src0) * vrow);
-                    gdst.push_back(slot_sc + kspan);
-                    gbytes.push_back(nb);
-                    ssrc.push_back(slot_sc + kspan);
-                    sdst.push_back(vbase + static_cast<size_t>(dst0) * vrow);
-                    sbytes.push_back(nb);
-                }
-            }
-            const int64_t t_g = ggml_time_us();
-            const int ng = static_cast<int>(gsrc.size());
-            if (!kvmem_d2d_batched(gsrc.data(), gdst.data(), gbytes.data(), ng)) {
-                for (int j = 0; j < ng && copy_ok; ++j) {
-                    copy_ok = kvmem_d2d(static_cast<uint8_t *>(gdst[j]),
-                                        static_cast<const uint8_t *>(gsrc[j]),
-                                        gbytes[j], st);
-                }
-            }
-            if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
-                copy_ok = false;
-                break;
-            }
+            const int64_t t_d2d = ggml_time_us();
+            copy_ok = kvmem_layout_apply(kbase, vbase, krow, vrow, block_tokens_,
+                                         moves.data(), moves.size(), scratch, scratch_stride,
+                                         scratch_blocks);
             if (retr_.enabled) {
-                retr_.layout_d2h_us += ggml_time_us() - t_g;
-            }
-            const int64_t t_s = ggml_time_us();
-            const int ns = static_cast<int>(ssrc.size());
-            if (!kvmem_d2d_batched(ssrc.data(), sdst.data(), sbytes.data(), ns)) {
-                for (int j = 0; j < ns && copy_ok; ++j) {
-                    copy_ok = kvmem_d2d(static_cast<uint8_t *>(sdst[j]),
-                                        static_cast<const uint8_t *>(ssrc[j]),
-                                        sbytes[j], st);
-                }
-            }
-            if (!copy_ok || cudaStreamSynchronize(st) != cudaSuccess) {
-                copy_ok = false;
-                break;
-            }
-            if (retr_.enabled) {
-                retr_.layout_h2d_us += ggml_time_us() - t_s;
+                retr_.layout_d2h_us += ggml_time_us() - t_d2d;
             }
         }
         cudaFree(scratch);
@@ -1137,12 +1113,12 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
             }
         }
     } else if (n_res > 0) {
-        const uint64_t payload_bytes =
-                static_cast<uint64_t>(n_layer_) * (krow + vrow) * block_tokens_;
+        const uint64_t payload_bytes = static_cast<uint64_t>(kvmem_n_attn_layers(model_)) *
+                (krow + vrow) * block_tokens_;
         std::vector<std::vector<uint8_t>> payloads(items.size());
         const int64_t t_d2h = ggml_time_us();
         for (size_t i = 0; i < items.size(); ++i) {
-            if (res_ix[i] == static_cast<size_t>(-1) || payload_bytes == 0) {
+            if (!items[i].resident || payload_bytes == 0) {
                 continue;
             }
             payloads[i].assign(static_cast<size_t>(payload_bytes), 0);
@@ -1868,6 +1844,117 @@ void llama_memory_kvmem::harvest_perf_print_sum() {
             (unsigned long long) mtp_nvme_syscalls);
 }
 
+bool llama_memory_kvmem::slot_inflight(int slot) const {
+    if (!d2h_ || slot < 0 || slot > 1) {
+        return false;
+    }
+    if (harvest_w_) {
+        std::lock_guard<std::mutex> lk(harvest_w_->mu);
+        return d2h_->slots[slot].inflight;
+    }
+    return d2h_->slots[slot].inflight;
+}
+
+void llama_memory_kvmem::d2h_release(int slot) {
+    if (!d2h_ || slot < 0 || slot > 1) {
+        return;
+    }
+    auto & s = d2h_->slots[slot];
+    if (s.gpu) {
+        cudaFree(s.gpu);
+        s.gpu = nullptr;
+    }
+    if (s.pin) {
+        cudaFreeHost(s.pin);
+        s.pin = nullptr;
+    }
+    s.cap = 0;
+}
+
+// Release idle staging when the card is already short of VRAM, so an allocation
+// of our own (layout scratch) still fits. KVMEM_STAGING_TRIM=0 keeps the cache.
+void llama_memory_kvmem::d2h_trim_idle() {
+    if (!d2h_ || !kvmem_env_flag("KVMEM_STAGING_TRIM")) {
+        return;
+    }
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    if (cudaMemGetInfo(&free_bytes, &total_bytes) != cudaSuccess ||
+        free_bytes >= kvmem_vram_reserve_bytes()) {
+        return;
+    }
+    for (int i = 0; i < 2; ++i) {
+        if (d2h_->slots[i].cap && !slot_inflight(i)) {
+            kvmem_diag("KVMEM_STAGING_TRIM slot=%d freed_bytes=%zu reason=layout\n",
+                       i, d2h_->slots[i].cap);
+            d2h_release(i);
+        }
+    }
+}
+
+// A full staging pair costs two ubatch payloads. Give back what is oversized and
+// idle when VRAM is tight: the pool and the layout scratch need it more than the
+// pipe needs a cached second slot. Decode payloads are tiny, so skip them - the
+// cudaFree sync would cost more than the bytes are worth.
+bool llama_memory_kvmem::d2h_grow(int slot, size_t bytes) {
+    if (!d2h_ || slot < 0 || slot > 1 || bytes == 0) {
+        return false;
+    }
+    constexpr size_t trim_min_bytes = 8u * 1024 * 1024;
+    auto & s = d2h_->slots[slot];
+    if (kvmem_env_flag("KVMEM_STAGING_TRIM") && bytes >= trim_min_bytes) {
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        const bool tight = cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess &&
+                free_bytes < bytes + kvmem_vram_reserve_bytes();
+        if (tight) {
+            const int other = 1 - slot;
+            if (d2h_->slots[other].cap > bytes && !slot_inflight(other)) {
+                kvmem_diag("KVMEM_STAGING_TRIM slot=%d freed_bytes=%zu need_bytes=%zu\n",
+                           other, d2h_->slots[other].cap, bytes);
+                d2h_release(other);
+            }
+        }
+    }
+    d2h_release(slot);
+    uint8_t * gpu = nullptr;
+    void * pin = nullptr;
+    if (!kvmem_cuda_ok(cudaMalloc(reinterpret_cast<void **>(&gpu), bytes), "gpu staging") ||
+        !kvmem_cuda_ok(cudaMallocHost(&pin, bytes), "pinned host")) {
+        if (gpu) {
+            cudaFree(gpu);
+        }
+        if (pin) {
+            cudaFreeHost(pin);
+        }
+        // Last resort: the sibling pair may be what stands in the way.
+        const int other = 1 - slot;
+        if (d2h_->slots[other].cap && !slot_inflight(other)) {
+            kvmem_diag("KVMEM_STAGING_TRIM slot=%d freed_bytes=%zu reason=grow_retry\n",
+                       other, d2h_->slots[other].cap);
+            d2h_release(other);
+            if (!kvmem_cuda_ok(cudaMalloc(reinterpret_cast<void **>(&gpu), bytes), "gpu staging") ||
+                !kvmem_cuda_ok(cudaMallocHost(&pin, bytes), "pinned host")) {
+                if (gpu) {
+                    cudaFree(gpu);
+                }
+                if (pin) {
+                    cudaFreeHost(pin);
+                }
+                return false;
+            }
+        } else {
+            return false;
+        }
+    }
+    s.gpu = gpu;
+    s.pin = static_cast<uint8_t *>(pin);
+    s.cap = bytes;
+    kvmem_diag("KVMEM_CAPTURE_MEMORY mode=raw slot0_bytes=%zu slot1_bytes=%zu last_bytes=%zu pinned_bytes=%zu\n",
+            d2h_->slots[0].cap, d2h_->slots[1].cap, bytes, d2h_->slots[0].cap + d2h_->slots[1].cap);
+    return true;
+}
+
 bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     if (!d2h_init() || pending_capture_.empty() || pos_queue_.empty()) {
         return false;
@@ -1904,23 +1991,9 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     perf_.last_event_us = 0;
     perf_.last_tail_sync_us = 0;
     const int64_t t_submit0 = ggml_time_us();
-    if (s.cap < bytes) {
-        if (s.gpu) {
-            cudaFree(s.gpu);
-            s.gpu = nullptr;
-        }
-        if (s.pin) {
-            cudaFreeHost(s.pin);
-            s.pin = nullptr;
-        }
-        if (!kvmem_cuda_ok(cudaMalloc(reinterpret_cast<void **>(&s.gpu), bytes), "gpu staging") ||
-            !kvmem_cuda_ok(cudaMallocHost(reinterpret_cast<void **>(&s.pin), bytes), "pinned host")) {
-            s.cap = 0;
-            return false;
-        }
-        s.cap = bytes;
-        kvmem_diag("KVMEM_CAPTURE_MEMORY mode=raw slot0_bytes=%zu slot1_bytes=%zu last_bytes=%zu pinned_bytes=%zu\n",
-                d2h_->slots[0].cap, d2h_->slots[1].cap, bytes, d2h_->slots[0].cap + d2h_->slots[1].cap);
+    if (s.cap < bytes && !d2h_grow(d2h_->next, bytes)) {
+        s.cap = 0;
+        return false;
     }
     if (be && !d2h_->compute_done) {
         ggml_backend_dev_t dev = ggml_backend_get_device(be);

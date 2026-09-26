@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -996,6 +997,394 @@ bool kvmem_d2d_batched(const void * const * src, void * const * dst,
     }
     return ok;
 }
+
+namespace {
+
+// Layout moves that actually move data, and the highest slot they touch.
+struct LayoutCells {
+    std::vector<size_t> live;
+    uint32_t max_slot = 0;
+};
+
+LayoutCells layout_live(const kvmem_layout_move * moves, size_t n_moves) {
+    LayoutCells out;
+    for (size_t i = 0; i < n_moves; ++i) {
+        if (moves[i].n_tokens == 0 || moves[i].src_slot == moves[i].dst_slot) {
+            continue;
+        }
+        out.live.push_back(i);
+        if (moves[i].src_slot > out.max_slot) out.max_slot = moves[i].src_slot;
+        if (moves[i].dst_slot > out.max_slot) out.max_slot = moves[i].dst_slot;
+    }
+    return out;
+}
+
+// KVMEM_LAYOUT_PRUNE=0 stages every move, like the all-gather the bounded path
+// was introduced to avoid. Read per call so a harness can flip it between
+// layouts, like the other layout knobs.
+bool layout_prune_enabled() {
+    const char * e = std::getenv("KVMEM_LAYOUT_PRUNE");
+    return !(e && e[0] == '0');
+}
+
+bool layout_trace() {
+    static const bool on = [] {
+        const char * e = std::getenv("KVMEM_TRACE");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    return on;
+}
+
+void layout_push(std::vector<const void *> & src, std::vector<void *> & dst,
+                 std::vector<size_t> & nbytes, const uint8_t * s, uint8_t * d, size_t nb) {
+    if (!s || !d || nb == 0) {
+        return;
+    }
+    src.push_back(s);
+    dst.push_back(d);
+    nbytes.push_back(nb);
+}
+
+bool layout_ops(const std::vector<const void *> & src, const std::vector<void *> & dst,
+                const std::vector<size_t> & nbytes) {
+    const int n = (int) src.size();
+    if (n == 0) {
+        return true;
+    }
+    if (n <= GATHER_MAX && kvmem_d2d_batched(src.data(), dst.data(), nbytes.data(), n)) {
+        return true;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (!cuda_ok(kvmem_copy_async(dst[i], src[i], nbytes[i], cudaMemcpyDeviceToDevice, stream()),
+                     "layout D2D")) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Gather the staged sources, then write staged and direct moves in one batch.
+// After the gather no write can touch a cell that a later move still reads:
+// direct moves read cells that no move writes, staged moves read the scratch.
+bool layout_two_phase(uint8_t * kb, uint8_t * vb, size_t krow, size_t vrow,
+                      uint64_t kspan, uint64_t vspan, uint64_t stride,
+                      const kvmem_layout_move * moves, const std::vector<size_t> & staged,
+                      const std::vector<size_t> & direct, uint8_t * scratch, size_t scratch_stride) {
+    if (!staged.empty() && (!scratch || scratch_stride < stride)) {
+        return false;
+    }
+    std::vector<const void *> src, ssrc;
+    std::vector<void *> dst, sdst;
+    std::vector<size_t> nbytes, sbytes;
+    for (size_t t = 0; t < staged.size(); ++t) {
+        const kvmem_layout_move & m = moves[staged[t]];
+        uint8_t * cell = scratch + t * stride;
+        if (kb && krow) {
+            const size_t nb = (size_t) m.n_tokens * krow;
+            layout_push(src, dst, nbytes, kb + (uint64_t) m.src_slot * kspan, cell, nb);
+            layout_push(ssrc, sdst, sbytes, cell, kb + (uint64_t) m.dst_slot * kspan, nb);
+        }
+        if (vb && vrow) {
+            const size_t nb = (size_t) m.n_tokens * vrow;
+            layout_push(src, dst, nbytes, vb + (uint64_t) m.src_slot * vspan, cell + kspan, nb);
+            layout_push(ssrc, sdst, sbytes, cell + kspan, vb + (uint64_t) m.dst_slot * vspan, nb);
+        }
+    }
+    for (size_t t = 0; t < direct.size(); ++t) {
+        const kvmem_layout_move & m = moves[direct[t]];
+        if (kb && krow) {
+            layout_push(ssrc, sdst, sbytes, kb + (uint64_t) m.src_slot * kspan,
+                        kb + (uint64_t) m.dst_slot * kspan, (size_t) m.n_tokens * krow);
+        }
+        if (vb && vrow) {
+            layout_push(ssrc, sdst, sbytes, vb + (uint64_t) m.src_slot * vspan,
+                        vb + (uint64_t) m.dst_slot * vspan, (size_t) m.n_tokens * vrow);
+        }
+    }
+    if (!layout_ops(src, dst, nbytes) ||
+        !cuda_ok(cudaStreamSynchronize(stream()), "layout gather sync")) {
+        return false;
+    }
+    return layout_ops(ssrc, sdst, sbytes) &&
+           cuda_ok(cudaStreamSynchronize(stream()), "layout scatter sync");
+}
+
+}  // namespace
+
+size_t kvmem_layout_staged(const kvmem_layout_move * moves, size_t n_moves) {
+    if (!moves || n_moves == 0) {
+        return 0;
+    }
+    const LayoutCells cells = layout_live(moves, n_moves);
+    if (cells.live.empty()) {
+        return 0;
+    }
+    if (!layout_prune_enabled()) {
+        return cells.live.size();
+    }
+    std::vector<uint8_t> written((size_t) cells.max_slot + 1, 0);
+    for (size_t k : cells.live) {
+        written[moves[k].dst_slot] = 1;
+    }
+    size_t staged = 0;
+    for (size_t k : cells.live) {
+        if (written[moves[k].src_slot]) {
+            ++staged;
+        }
+    }
+    return staged;
+}
+
+size_t kvmem_layout_scratch_blocks(const kvmem_layout_move * moves, size_t n_moves, size_t stride) {
+    const size_t staged = kvmem_layout_staged(moves, n_moves);
+    if (staged == 0) {
+        return 0;
+    }
+    const char * e = std::getenv("KVMEM_LAYOUT_SCRATCH_KB");
+    const size_t cap_kb = (e && e[0]) ? (size_t) std::strtoull(e, nullptr, 10) : 0;
+    if (cap_kb == 0 || stride == 0) {
+        return staged;
+    }
+    size_t cap = (cap_kb * 1024) / stride;
+    if (cap < 1) {
+        cap = 1;
+    }
+    return cap < staged ? cap : staged;
+}
+
+bool kvmem_layout_bounded_enabled() {
+    // Read per call: the layout path is chosen once per retrieval, and a test or
+    // a harness must be able to flip the knob between calls.
+    const char * e = std::getenv("KVMEM_LAYOUT_BOUNDED");
+    return !(e && e[0] == '0');
+}
+
+
+namespace {
+
+// A copy into a cell carries the data of the move that owns that destination.
+size_t layout_cell_bytes(const std::vector<size_t> & live, const std::vector<int32_t> & writer,
+                         const kvmem_layout_move * moves, size_t krow, size_t vrow,
+                         uint32_t slot, bool is_k) {
+    const int32_t w = writer[slot];
+    if (w < 0) {
+        return 0;
+    }
+    const uint32_t nt = moves[live[(size_t) w]].n_tokens;
+    return is_k ? (size_t) nt * krow : (size_t) nt * vrow;
+}
+
+// Bounded fallback: copy what can be copied in dependency order and rotate the
+// remaining cycles through one spare block, so a failed large cudaMalloc
+// degrades to smaller copies instead of the host round trip. Needs a valid
+// partial permutation; anything else returns false for the host fallback.
+bool layout_bounded(uint8_t * kb, uint8_t * vb, size_t krow, size_t vrow,
+                    uint64_t kspan, uint64_t vspan, uint64_t stride,
+                    const kvmem_layout_move * moves, const LayoutCells & cells,
+                    uint8_t * scratch, size_t scratch_stride) {
+    if (!scratch || scratch_stride < stride) {
+        return false;
+    }
+    const std::vector<size_t> & live = cells.live;
+    std::vector<int32_t> writer((size_t) cells.max_slot + 1, -1);
+    std::vector<int32_t> reader((size_t) cells.max_slot + 1, -1);
+    for (size_t k = 0; k < live.size(); ++k) {
+        const kvmem_layout_move & m = moves[live[k]];
+        if (writer[m.dst_slot] >= 0 || reader[m.src_slot] >= 0) {
+            return false;
+        }
+        writer[m.dst_slot] = (int32_t) k;
+        reader[m.src_slot] = (int32_t) k;
+    }
+    auto cell_bytes = [&](uint32_t slot, bool is_k) {
+        return layout_cell_bytes(live, writer, moves, krow, vrow, slot, is_k);
+    };
+    auto copy_cells = [&](uint32_t src_slot, uint32_t dst_slot) -> bool {
+        const size_t nk = cell_bytes(dst_slot, true);
+        const size_t nv = cell_bytes(dst_slot, false);
+        if (kb && nk && !cuda_ok(kvmem_copy_async(kb + (uint64_t) dst_slot * kspan,
+                                                  kb + (uint64_t) src_slot * kspan, nk,
+                                                  cudaMemcpyDeviceToDevice, stream()),
+                                 "layout cycle D2D")) {
+            return false;
+        }
+        if (vb && nv && !cuda_ok(kvmem_copy_async(vb + (uint64_t) dst_slot * vspan,
+                                                  vb + (uint64_t) src_slot * vspan, nv,
+                                                  cudaMemcpyDeviceToDevice, stream()),
+                                 "layout cycle D2D")) {
+            return false;
+        }
+        return true;
+    };
+
+    auto park = [&](uint32_t src_slot, uint32_t size_slot) -> bool {
+        const size_t nk = cell_bytes(size_slot, true);
+        const size_t nv = cell_bytes(size_slot, false);
+        if (kb && nk && !cuda_ok(kvmem_copy_async(scratch, kb + (uint64_t) src_slot * kspan, nk,
+                                                  cudaMemcpyDeviceToDevice, stream()),
+                                 "layout spare D2D")) {
+            return false;
+        }
+        if (vb && nv && !cuda_ok(kvmem_copy_async(scratch + kspan, vb + (uint64_t) src_slot * vspan,
+                                                  nv, cudaMemcpyDeviceToDevice, stream()),
+                                 "layout spare D2D")) {
+            return false;
+        }
+        return true;
+    };
+    auto restore = [&](uint32_t dst_slot) -> bool {
+        const size_t nk = cell_bytes(dst_slot, true);
+        const size_t nv = cell_bytes(dst_slot, false);
+        if (kb && nk && !cuda_ok(kvmem_copy_async(kb + (uint64_t) dst_slot * kspan, scratch, nk,
+                                                  cudaMemcpyDeviceToDevice, stream()),
+                                 "layout spare D2D")) {
+            return false;
+        }
+        if (vb && nv && !cuda_ok(kvmem_copy_async(vb + (uint64_t) dst_slot * vspan, scratch + kspan,
+                                                  nv, cudaMemcpyDeviceToDevice, stream()),
+                                 "layout spare D2D")) {
+            return false;
+        }
+        return true;
+    };
+    // A move may run once the cell it writes is not read by a pending move.
+    const size_t nlive = live.size();
+    std::vector<int32_t> dep(nlive, -1);
+    std::vector<std::vector<int32_t>> waiters(nlive);
+    for (size_t k = 0; k < nlive; ++k) {
+        const int32_t j = reader[moves[live[k]].dst_slot];
+        if (j >= 0 && j != (int32_t) k) {
+            dep[k] = j;
+            waiters[(size_t) j].push_back((int32_t) k);
+        }
+    }
+    std::vector<uint8_t> done(nlive, 0);
+    std::vector<int32_t> todo;
+    for (size_t k = 0; k < nlive; ++k) {
+        if (dep[k] < 0) {
+            todo.push_back((int32_t) k);
+        }
+    }
+    while (!todo.empty()) {
+        const int32_t k = todo.back();
+        todo.pop_back();
+        if (done[(size_t) k]) {
+            continue;
+        }
+        if (!copy_cells(moves[live[(size_t) k]].src_slot, moves[live[(size_t) k]].dst_slot)) {
+            return false;
+        }
+        done[(size_t) k] = 1;
+        for (int32_t w : waiters[(size_t) k]) {
+            if (!done[(size_t) w]) {
+                todo.push_back(w);
+            }
+        }
+    }
+    for (size_t k = 0; k < nlive; ++k) {
+        if (done[k]) {
+            continue;
+        }
+        std::vector<uint32_t> ring;
+        const uint32_t start = moves[live[k]].src_slot;
+        uint32_t cell = start;
+        for (;;) {
+            ring.push_back(cell);
+            const int32_t own = reader[cell];
+            if (own < 0) {
+                return false;
+            }
+            cell = moves[live[(size_t) own]].dst_slot;
+            if (cell == start) {
+                break;
+            }
+            if (ring.size() > nlive) {
+                return false;
+            }
+        }
+        const size_t len = ring.size();
+        if (len < 2) {
+            return false;
+        }
+        // Park one cell in the spare, rotate the ring backwards, then refill it.
+        if (!park(ring[0], ring[1])) {
+            return false;
+        }
+        for (size_t t = len - 1; t >= 1; --t) {
+            if (!copy_cells(ring[t], ring[(t + 1) % len])) {
+                return false;
+            }
+        }
+        if (!restore(ring[1])) {
+            return false;
+        }
+        for (uint32_t c : ring) {
+            if (writer[c] >= 0) {
+                done[(size_t) writer[c]] = 1;
+            }
+        }
+    }
+    for (size_t k = 0; k < nlive; ++k) {
+        if (!done[k]) {
+            return false;
+        }
+    }
+    return cuda_ok(cudaStreamSynchronize(stream()), "layout cycle sync");
+}
+
+}  // namespace
+
+
+bool kvmem_layout_apply(void * kbase, void * vbase, size_t krow, size_t vrow,
+                        uint32_t block_tokens, const kvmem_layout_move * moves, size_t n_moves,
+                        void * scratch, size_t scratch_stride, size_t scratch_blocks) {
+    if (!moves || n_moves == 0 || block_tokens == 0) {
+        return true;
+    }
+    uint8_t * kb = static_cast<uint8_t *>(kbase);
+    uint8_t * vb = static_cast<uint8_t *>(vbase);
+    if (!kb && !vb) {
+        return true;
+    }
+    const LayoutCells cells = layout_live(moves, n_moves);
+    if (cells.live.empty()) {
+        return true;
+    }
+    const uint64_t kspan = (uint64_t) block_tokens * krow;
+    const uint64_t vspan = (uint64_t) block_tokens * vrow;
+    const uint64_t stride = kspan + vspan;
+
+    std::vector<size_t> staged, direct;
+    if (layout_prune_enabled()) {
+        std::vector<uint8_t> written((size_t) cells.max_slot + 1, 0);
+        for (size_t k : cells.live) {
+            written[moves[k].dst_slot] = 1;
+        }
+        for (size_t k : cells.live) {
+            (written[moves[k].src_slot] ? staged : direct).push_back(k);
+        }
+    } else {
+        staged = cells.live;
+    }
+    if (staged.size() <= scratch_blocks) {
+        if (layout_trace()) {
+            fprintf(stderr, "KVMEM stagein layout path=batched moves=%zu staged=%zu blocks=%zu\n",
+                    cells.live.size(), staged.size(), scratch_blocks);
+        }
+        return layout_two_phase(kb, vb, krow, vrow, kspan, vspan, stride, moves, staged, direct,
+                                static_cast<uint8_t *>(scratch), scratch_stride);
+    }
+    if (!kvmem_layout_bounded_enabled()) {
+        return false;
+    }
+    if (layout_trace()) {
+        fprintf(stderr, "KVMEM stagein layout path=bounded moves=%zu staged=%zu blocks=%zu\n",
+                cells.live.size(), staged.size(), scratch_blocks);
+    }
+    return layout_bounded(kb, vb, krow, vrow, kspan, vspan, stride, moves, cells,
+                          static_cast<uint8_t *>(scratch), scratch_stride);
+}
+
 
 bool kvmem_meank_ready(uint32_t n_layer, uint32_t n_embd) {
     if (n_layer == 0 || n_embd == 0) {

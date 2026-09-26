@@ -708,6 +708,23 @@ Why: product is llama.cpp engine + thin KVMem; FA freeze; months of sm_120 owner
 
 Revisit only if the user explicitly asks after Stage 1–3 numbers.
 
+### Stage 5 - Q capture reduction (planned, not done)
+
+The largest KVMem temp on the card is the Q half of the capture pipe. The query-span ubatch carries 16 full-length F32 Q tensors; measured 27B IQ3 24k `-ub 1024`: 226 MiB in one staging slot against 64 MiB for the K-only ubatch, and the same 2-slot pipe means around 770 MiB per slot at `-ub 2048`. That is the allocation that fails first when VRAM runs out.
+
+`accumulate_query_row` only needs the sum of the rows that fall in the query / prefill span, so the transfer scales with the ubatch for no reason.
+
+Plan:
+
+- Device-side span sum, shaped like the existing mean-K kernels (`kvmem_meank_*`), fed with a per-row mask built from `query_contains` / `prefill_query_contains`.
+- The adapter keeps `reset_prefill_acc` semantics for the prefill span; a ubatch that mixes two prefill spans falls back to the current full staging, so the peak stays a worst case instead of the norm.
+- Gate: 24k recipe identity (same `content_sha`), retrieval selection diff = 0, and `KVMEM_CAPTURE_MEMORY` showing the smaller slot.
+
+This is not the earlier "reduce on the GPU to save prefill time" idea, which measured ~0.2% and was dropped (`temp/harvest-ubatch-cost-plan.md` section 0.6.3). The objective here is VRAM, where the same reduction gives back 226 MiB to 770 MiB per slot plus the matching D2H traffic.
+
+Related, landed 2026-09-27: staging only grows, so the pipe now gives idle staging back under pressure (`KVMEM_STAGING_TRIM`, `KVMEM_TEMP_BUDGET_MB`). Details in the temp VRAM section of `retrieval-stagein-optimization.md`.
+
+
 ---
 
 ## API / Interface Changes

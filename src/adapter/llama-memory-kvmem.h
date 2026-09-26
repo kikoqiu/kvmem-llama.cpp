@@ -281,6 +281,10 @@ private:
     bool d2h_init();
     void d2h_free();
     void d2h_commit(int slot);
+    bool d2h_grow(int slot, size_t bytes);
+    void d2h_release(int slot);
+    void d2h_trim_idle();
+    bool slot_inflight(int slot) const;
     bool d2h_submit(struct ggml_backend * be);
     bool harvest_perf_on() const { return perf_.enabled; }
     void harvest_perf_emit_graph_line();

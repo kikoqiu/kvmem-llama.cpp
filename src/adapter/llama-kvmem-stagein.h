@@ -52,6 +52,32 @@ void kvmem_stageout_clear();
 bool kvmem_d2d_batched(const void * const * src, void * const * dst,
                        const size_t * nbytes, int n);
 
+// One block move of the retrieval layout: `n_tokens` rows from cell src_slot
+// must end up in cell dst_slot of the same layer.
+struct kvmem_layout_move {
+    uint32_t src_slot = 0;
+    uint32_t dst_slot = 0;
+    uint32_t n_tokens = 0;
+};
+
+// Moves that need the scratch: their source cell is written by another move.
+// Moves whose source is not a destination can be copied directly, in any order.
+size_t kvmem_layout_staged(const kvmem_layout_move * moves, size_t n_moves);
+// Scratch size in blocks for this plan. KVMEM_LAYOUT_SCRATCH_KB caps it (0 =
+// size the whole staged set), so the caller can force the bounded path.
+size_t kvmem_layout_scratch_blocks(const kvmem_layout_move * moves, size_t n_moves, size_t stride);
+// KVMEM_LAYOUT_BOUNDED=0 restores the old all-or-nothing scratch allocation.
+bool kvmem_layout_bounded_enabled();
+
+// Applies the moves to one layer in place. With `scratch_blocks` covering the
+// staged set this is a batched gather+scatter; otherwise the moves that cannot
+// be ordered are rotated through one spare block, so a failed large
+// cudaMalloc degrades to smaller copies instead of the host round trip.
+// vbase is null when V is transposed (V is then left alone).
+bool kvmem_layout_apply(void * kbase, void * vbase, size_t krow, size_t vrow,
+                        uint32_t block_tokens, const kvmem_layout_move * moves, size_t n_moves,
+                        void * scratch, size_t scratch_stride, size_t scratch_blocks);
+
 // Decode mean-K running sum on GPU. Extra VRAM = n_layer * n_embd * 4.
 bool kvmem_meank_ready(uint32_t n_layer, uint32_t n_embd);
 void kvmem_meank_free();

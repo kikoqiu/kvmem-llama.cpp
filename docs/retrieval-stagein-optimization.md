@@ -39,6 +39,7 @@ This plan is: time the 229 s, then stop using host as a scratchpad for **already
 | PR 1 batched get/set | **20.6 s** | also 371→792 tok/s prefill (evict V harvest) |
 | PR 2 layout D2D | 16k layout 1.07 s→70 ms | 128k not re-run; expect ~8.4 s layout gone |
 | PR 3 `--kvmem-harvest-v` | 16k `stage_out` 905→414 ms | remaining is `seq_rm`/admit, not `read_gpu_block` |
+| PR 5 layout scratch bounds (2026-09-27) | 27B IQ3 24k: layout 113 -> 117 ms worst case | staged set 60 -> 29 blocks; 1-block spare fallback; MTP shares the helper |
 
 128k PR 1 SUM (`n_move=795` `n_raw=1080` `laid_out=1`): layout_d2h+h2d 8.4 s, **stage_out 6.4 s**, set 3.5 s, copy 1.5 s, rope 0.3 s, score 0.2 s. After PR 2 the remaining ceiling is ~**stage_out + cold set**.
 
@@ -241,3 +242,23 @@ Hardware: 5050 UUID `GPU-14f08a8c-8d62-4338-8ae4-c669889cdb29` for **< 27B**; 50
 ## Open Questions
 
 None that block PR 3. Default `--kvmem-harvest-v` is **off** so RAM-only speed recipes stay comparable; long-ctx NVMe recipes pass both `--kvmem-harvest-v` and `--kvmem-raw-k-nvme`.
+
+---
+
+## 2026-09-27 - Temp VRAM bounds (layout scratch + staging)
+
+Measured on 27B IQ3_XXS + mmproj, 24k prompt, `-c 262144 --kvmem-budget 20480`, `-ctk q8_0 -ctv q4_0`, `-ub 1024`, V100 16 GiB. Four configurations - new defaults, all four switches off, forced 1-block scratch, forced trim - produced the same output (`content_sha` token-for-token).
+
+| configuration | staged blocks | scratch | layout ms | prompt ms |
+|---|---|---|---|---|
+| all four switches off | 60 | 12.2 MiB | 112.6 | 35275 |
+| new defaults (prune on) | 29 | 6.0 MiB | 142.7 (cold first run) | 35703 |
+| `KVMEM_LAYOUT_SCRATCH_KB=1` + prune off | 60 | 1 block | 117.4 | 35066 |
+| `KVMEM_TEMP_BUDGET_MB=15000` (force trim) | 29 | 6.0 MiB | 112.5 | 35005 |
+
+- `staged` = moves whose source cell is written by another move. Those are gathered before anything is written; the rest are copied directly in the same write batch, so one sync pair per layer still holds. Scratch = `staged` blocks of `block_tokens * (krow + vrow)`.
+- Bounded path: when the scratch cannot cover the staged set, the copies are ordered by dependency and what is left (cycles) rotates through one spare block. `KVMEM_LAYOUT_BOUNDED=0` keeps the old all-or-nothing allocation and the host D2H+H2D fallback, which is also what a plan that is not a partial permutation gets.
+- Staging: the 2-slot `CaptureD2hPipe` only grows, and the Q-bearing ubatch set one slot to 226 MiB while the other held 64 MiB. Trim releases an idle slot when free VRAM is below `KVMEM_TEMP_BUDGET_MB` and retries the allocation once with the sibling released. `cap_blocks` now reserves that budget as well (2341 vs 2498 here; this recipe is budget-bound so the pool size is unchanged).
+
+Not done in this round: staging stays sized to the largest ubatch (no ring staging - it would put the graph back behind the D2H), and Q capture remains the largest single temp: 226 MiB of the 290 MiB above, ~770 MiB per slot at ub 2048. The Q reduction plan is in `prefill-harvest-optimization.md` (Stage 5).
+

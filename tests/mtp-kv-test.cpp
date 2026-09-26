@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -37,6 +38,18 @@ static void require(bool ok, const char * message) {
     if (!ok) {
         throw std::runtime_error(message);
     }
+}
+
+static void kvmem_test_setenv(const char * name, const char * value) {
+#ifdef _WIN32
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
 }
 
 static std::vector<uint8_t> pattern(size_t size, unsigned seed) {
@@ -132,7 +145,11 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type_k, ggml
         {3, 5, block}, {5, 7, block}, {7, 3, 13},
     };
 #ifdef KVMEM_TEST_CUDA
-    // A failed optional scratch allocation must leave KV and CUDA state intact.
+    // An oversized scratch request must fail cleanly and leave KV and CUDA state
+    // intact. Pruning and the bounded fallback are off on purpose: with them on, a
+    // plan like this never asks for a whole-set buffer in the first place.
+    kvmem_test_setenv("KVMEM_LAYOUT_BOUNDED", "0");
+    kvmem_test_setenv("KVMEM_LAYOUT_PRUNE", "0");
     size_t free_bytes = 0, total_bytes = 0;
     require(cudaMemGetInfo(&free_bytes, &total_bytes) == cudaSuccess, "CUDA memory query failed");
     const size_t stride = block * (ggml_row_size(type_k, tensors[0]->ne[0]) +
@@ -144,6 +161,8 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type_k, ggml
     for (int i = 0; i < 2; ++i) {
         compare(tensors[i], expected[i]);
     }
+    kvmem_test_setenv("KVMEM_LAYOUT_BOUNDED", nullptr);
+    kvmem_test_setenv("KVMEM_LAYOUT_PRUNE", nullptr);
 #endif
     for (int i = 0; i < 2; ++i) {
         const auto before = expected[i];
@@ -153,10 +172,29 @@ static void check_transfers(llama_memory_kvmem_mtp & mtp, ggml_type type_k, ggml
                         expected[i].data() + move.dst_slot * block * row);
         }
     }
+    std::vector<std::vector<uint8_t>> pre(2);
+    for (int i = 0; i < 2; ++i) {
+        pre[i].resize(ggml_nbytes(tensors[i]));
+        ggml_backend_tensor_get(tensors[i], pre[i].data(), 0, pre[i].size());
+    }
     require(mtp.layout_d2d(moves, 3), "MTP CUDA layout failed");
     for (int i = 0; i < 2; ++i) {
         compare(tensors[i], expected[i]);
     }
+    // The same plan through the bounded path (one spare block, no pruning) must
+    // land the same bytes: it rotates the cycle instead of gathering it.
+    kvmem_test_setenv("KVMEM_LAYOUT_SCRATCH_KB", "1");
+    kvmem_test_setenv("KVMEM_LAYOUT_PRUNE", "0");
+    for (int i = 0; i < 2; ++i) {
+        ggml_backend_tensor_set(tensors[i], pre[i].data(), 0, pre[i].size());
+    }
+    require(mtp.layout_d2d(moves, 3), "MTP bounded CUDA layout failed");
+    for (int i = 0; i < 2; ++i) {
+        compare(tensors[i], expected[i]);
+    }
+    kvmem_test_setenv("KVMEM_LAYOUT_SCRATCH_KB", nullptr);
+    kvmem_test_setenv("KVMEM_LAYOUT_PRUNE", nullptr);
+    require(cudaGetLastError() == cudaSuccess, "bounded layout leaked a CUDA error");
 }
 
 static void check_target_transfers(llama_memory_kvmem & mem, ggml_type type_k, ggml_type type_v) {
