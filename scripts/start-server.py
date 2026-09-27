@@ -341,7 +341,7 @@ def main():
     argv = [str(binary), '-m', str(model), '--mmproj', str(mmproj),
             '--mmproj-offload' if vision == 'gpu' else '--no-mmproj-offload',
             '--image-max-tokens', str(image_tokens), '--host', host, '--port', str(port),
-            '-c', '262144', '-n', str(args.reserve),
+            '-c', '262144',
             '--kvmem-budget', str(args.budget), '--kvmem-gen-reserve', str(args.reserve),
             '--kv-dtype', args.kv, '--spec-type', 'draft-mtp',
             '--enable-thinking', '--reasoning-budget', '4096']

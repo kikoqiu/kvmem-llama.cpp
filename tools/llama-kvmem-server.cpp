@@ -2149,9 +2149,17 @@ int main(int argc, char ** argv) {
         st.kparams.gen_exceed != 1;
     const int generation_limit = gen_reserve_cap ?
         std::min(n_ctx, (int) st.kparams.gen_reserve) : n_ctx;
-    // An omitted max_tokens keeps the recipe's reserve as the output default.
-    const int output_default = st.n_predict_default > 0 ? st.n_predict_default :
-        (st.kparams.enabled && st.kparams.gen_reserve > 0 ? (int) st.kparams.gen_reserve : generation_limit);
+    // An omitted max_tokens keeps a recipe default. The v1 stop can only use the
+    // reserve; retrieval spans the whole pool, so its default is budget +
+    // gen_reserve (budget 0 is identity: the pool is the context).
+    int output_default = generation_limit;
+    if (st.n_predict_default > 0) {
+        output_default = st.n_predict_default;
+    } else if (gen_reserve_cap) {
+        output_default = (int) st.kparams.gen_reserve;
+    } else if (st.kparams.enabled && st.kparams.gen_reserve > 0 && st.kparams.budget > 0) {
+        output_default = (int) st.kparams.budget + (int) st.kparams.gen_reserve;
+    }
     const int default_max_tokens = std::min(output_default, generation_limit);
     startup["context_actual"] = llama_n_ctx(st.ctx);
     startup["batch_actual"] = llama_n_batch(st.ctx);

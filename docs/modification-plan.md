@@ -60,7 +60,7 @@
 
 已知 v1 限制（后续单独立项，不挡当前 retrieval）：
 
-- **生成长度（已实现）。** `--kvmem-gen-exceed retrieval`（默认）在 `gen_reserve` 槽位满时对整个池（`budget + gen_reserve`）重选一次：query 块保持 mandatory，落选块先 harvest（packed K/V + decode mean-K）再下到 host store，select 窗口回到 `budget` 内，`gen_reserve` 区重新空出来继续 decode。`--kvmem-gen-exceed error` 保留 v1 行为（`no free GPU slot` / `llama_decode(gen) failed`，server 把 `max_tokens` 夹到 `gen_reserve`）。swap 依赖 packed V，即需要 `-fa on`；转置 V 的构建回落 error。详见 `docs/architecture.md`「Generation length vs gen_reserve」。
+- **生成长度（已实现）。** `--kvmem-gen-exceed retrieval`（默认）在 `gen_reserve` 槽位满时对整个池（`budget + gen_reserve`）重选一次：query 块保持 mandatory，落选块先 harvest（packed K/V + decode mean-K）再下到 host store，select 窗口回到 `budget` 内，`gen_reserve` 区重新空出来继续 decode。`--kvmem-gen-exceed error` 保留 v1 行为（`no free GPU slot` / `llama_decode(gen) failed`，server 把 `max_tokens` 夹到 `gen_reserve`）。请求省略 `max_tokens` 时的默认输出也按模式取值：retrieval 是整个池（`budget + gen_reserve`），error 仍是 `gen_reserve`；启动脚本不再传 `-n`，让服务端默认生效。swap 依赖 packed V，即需要 `-fa on`；转置 V 的构建回落 error。详见 `docs/architecture.md`「Generation length vs gen_reserve」。
 - **质量权衡。** swap 用同一套打分在「本轮已写块 + 历史块」里重选：sink 前缀、`--kvmem-recent-tokens` 后缀策略不变，query 块 / incoming 行 / 正在写的尾块先留，其余按分数竞争，落选的（可能是历史块，也可能是本轮块）留在 host store，下一轮 retrieval 可以再选回来。要保证本轮输出保留更长就调大 `--kvmem-recent-tokens`（前缀由 `--kvmem-sink-tokens` 控制）。「本轮内看到更早的思考」仍不在这个切口里。
 
 ---

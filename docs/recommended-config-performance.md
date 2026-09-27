@@ -13,7 +13,8 @@
 | 主 KV / MTP KV | Q8_0 / F16 | Q5_0 / F16 |
 | MTP 草稿长度 / 状态保存 | 3 / ReplaySSM | 3 / ReplaySSM |
 | 检索预算 | 36864（36 × 1024） | 32768（32 × 1024） |
-| 生成预留 / 默认最大输出 | 16384（16 × 1024） | 12288（12 × 1024） |
+| 生成预留（`gen_reserve`） | 16384（16 × 1024） | 12288（12 × 1024） |
+| 省略 `max_tokens` 的默认输出 | 53248（整个池 = budget + reserve） | 45056（整个池） |
 | context / batch | 262144 / 512 | 262144 / 512 |
 | 脚本默认图片 token 上限 | 512 | 512 |
 | query replay / policy | auto / user | auto / user |

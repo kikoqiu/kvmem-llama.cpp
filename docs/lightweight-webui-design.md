@@ -83,7 +83,7 @@
 
 当前上游 UI 把 medium 映射成 2048 token、low 映射成 512 token。轻量版必须移除这个联动。当前 GSQ 模板可提供 low/medium/xhigh 快捷项；未知自定义模板不硬套这些档位，保持默认或输入模板支持的值。UI 一种参数只产生一种字段，不同时写顶层与 kwargs 的 effort。
 
-最大输出不提供“无限”。默认跟随当前服务的输出设置，UI 按 `generation_limit` 校验。服务端兼容规则：省略或 `max_tokens=-1` 使用服务默认值并受生成预留限制；0、其他负数、非整数和显式超过上限的值返回清晰的 400。设置 `max_completion_tokens` 时遵循相同校验，两个别名的优先级保持现有实现。
+最大输出不提供“无限”。默认跟随当前服务的输出设置，UI 按 `generation_limit` 校验。服务端兼容规则：省略或 `max_tokens=-1` 使用服务默认值，该默认值按模式取值——`--kvmem-gen-exceed retrieval`（默认）是整个池 `budget + gen_reserve`，`error` 是 `gen_reserve`；任何取值都受 `generation_limit`（`-c`）限制。0、其他负数、非整数和显式超过上限的值返回清晰的 400。设置 `max_completion_tokens` 时遵循相同校验，两个别名的优先级保持现有实现。
 
 这项兼容只解决现有上游 UI 的 `-1` 语义，不引入自动修改检索预算、自动扩容或 ring buffer。
 

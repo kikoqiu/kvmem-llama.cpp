@@ -77,8 +77,10 @@ decode mean-K and are selectable again by a later turn's query.
 `no free GPU slot for block N` (`llama_decode(gen) failed rc=1`), and one
 generation cannot exceed `--kvmem-gen-reserve` (16384 on IQ3, 12288 on IQ4,
 CLI default 256), thinking included. `llama-kvmem-server` caps `max_tokens`
-at the reserve in this mode; with the retrieval default the logical context
-(`-c`) is the only limit.
+at the reserve in this mode, and the reserve is also the output length a request
+gets when it omits `max_tokens`. With the retrieval default the logical context
+(`-c`) is the only limit, and an omitted `max_tokens` uses the whole pool
+(`budget + gen_reserve`).
 
 The swap is an ordinary retrieval reselect, so it needs the packed host copy
 of every block it drops. Packed V exists only with flash attention

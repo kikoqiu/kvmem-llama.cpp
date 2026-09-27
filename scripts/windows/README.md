@@ -51,6 +51,7 @@ When adding argument lines, retain PowerShell's trailing backtick on every conti
 | Context / 上下文 | 262144 | 262144 |
 | KVMem budget / 工作集 | 36864 | 32768 |
 | Generation reserve / 生成预留 | 16384 | 12288 |
+| Omitted `max_tokens` / 省略 `max_tokens` 的默认输出 | 53248 (whole pool / 整个池) | 45056 (whole pool / 整个池) |
 | Main K/V | Q8/Q8 | Q5/Q5 |
 | MTP draft / 草稿 | F16, MTP3/ReplaySSM | F16, MTP3/ReplaySSM |
 | Vision / 视觉头 | CPU | CPU |
@@ -69,7 +70,7 @@ Both UIs are included. Full UI does not add backend tool execution or stream res
 ```powershell
 $env:CUDA_VISIBLE_DEVICES = '0'
 .\bin\llama-kvmem-server.exe -m 'D:\models\Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf' `
-  --host 127.0.0.1 --port 18200 -c 262144 -n 16384 `
+  --host 127.0.0.1 --port 18200 -c 262144 `
   --kvmem-budget 36864 --kvmem-gen-reserve 16384 `
   -ctk q8_0 -ctv q8_0 --spec-type draft-mtp --spec-draft-n-max 3 `
   --enable-thinking --reasoning-budget 4096 --verbosity 3

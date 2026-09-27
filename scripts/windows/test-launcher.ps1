@@ -47,6 +47,7 @@ public class ArgvEcho {
         if ($recipe -eq 'iq4') { $limit = '12288'; $budget = '32768'; $vision = '--no-mmproj-offload'; $kv = 'q5_0' }
         Check ($a[[Array]::IndexOf($a, '--kvmem-gen-reserve') + 1] -eq $limit) 'generation reserve'
         Check ($a[[Array]::IndexOf($a, '--kvmem-budget') + 1] -eq $budget) 'retrieval budget'
+        Check ($a -notcontains '-n') 'output default comes from the server'
         Check ($a[[Array]::IndexOf($a, '--kv-dtype') + 1] -eq $kv) 'KV type'
         Check ($a -contains $vision) 'vision placement'
         Check ($a -notcontains '--mmproj-offload') 'default vision must not use GPU'

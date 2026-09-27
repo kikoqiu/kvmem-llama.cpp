@@ -243,10 +243,10 @@ class LauncherTests(unittest.TestCase):
             for flag in ('--temp', '--top-p', '--top-k', '--min-p', '--presence-penalty',
                          '--frequency-penalty', '--repeat-penalty', '--kvmem', '--kvmem-method',
                          '--kvmem-block-tokens', '--kvmem-query-policy', '--kvmem-query-replay',
-                         '--spec-kv-dtype', '--spec-draft-n-max', '--kvmem-mtp-state', '-b', '-ngl'):
+                         '--spec-kv-dtype', '--spec-draft-n-max', '--kvmem-mtp-state', '-b', '-ngl', '-n'):
                 self.assertNotIn(flag, argv)
             for flag, value in [('--kv-dtype', kv), ('--kvmem-budget', budget),
-                                ('--kvmem-gen-reserve', reserve), ('-n', reserve)]:
+                                ('--kvmem-gen-reserve', reserve)]:
                 self.assertEqual(argv[argv.index(flag) + 1], value)
         argv = json.loads(self.run_recipe('iq3', '--dry-run', overrides={
             'KVMEM_QUERY_REPLAY': 'legacy', 'KVMEM_QUERY_POLICY': 'legacy'}).stdout)['argv']

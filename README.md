@@ -24,7 +24,7 @@ KVMem retrieves relevant historical blocks into a bounded GPU window, limiting t
 
 Current milestone: [`v0.16.0-rc3`](docs/milestones/v0.16.0-rc3.md) (pre-release).
 
-**Generation length.** `--kvmem-gen-reserve` is the decode slack inside the GPU pool (`budget + gen_reserve`). When a generation fills that slack, `--kvmem-gen-exceed retrieval` (the default) reselects the whole pool: this turn's already written blocks and older history are ranked by the same query score, the losers leave the GPU, the reserve region is free again, and decoding continues. `--kvmem-gen-exceed error` keeps the v1 behavior and stops with `no free GPU slot` once the reserve is full. The swap restores dropped blocks from the packed host copy, which needs flash attention (`-fa on`); without it the policy falls back to the error. For agent use, a system-prompt cap such as *Keep each turn's output, including thinking, within 16384 tokens* still keeps the working set stable for long turns.
+**Generation length.** `--kvmem-gen-reserve` is the decode slack inside the GPU pool (`budget + gen_reserve`). When a generation fills that slack, `--kvmem-gen-exceed retrieval` (the default) reselects the whole pool: this turn's already written blocks and older history are ranked by the same query score, the losers leave the GPU, the reserve region is free again, and decoding continues. A request that omits `max_tokens` then defaults to the whole pool. `--kvmem-gen-exceed error` keeps the v1 behavior and stops with `no free GPU slot` once the reserve is full; there the omitted default stays at the reserve. The swap restores dropped blocks from the packed host copy, which needs flash attention (`-fa on`); without it the policy falls back to the error. For agent use, a system-prompt cap such as *Keep each turn's output, including thinking, within 16384 tokens* still keeps the working set stable for long turns.
 
 Version: **0.16.0-rc3**. See the [English / 中文 release notes](docs/releases/v0.16.0-rc3.md) for CUDA build choices and measured results.
 
@@ -42,7 +42,7 @@ Core flags (what the 16 GiB recipes still pass):
 | `--kvmem-budget` | How many historical tokens retrieval may keep on GPU. |
 | `--kvmem-sink-tokens N` | Server and CLI: always keep the prefix in the GPU working set. Default `0` keeps one block (not disabled). Positive values round down to whole blocks, with a minimum of one block. For example, with block size 128, `1024` keeps 1024 tokens and `129` keeps 128. These blocks count toward `--kvmem-budget`. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. When a generation fills them, `--kvmem-gen-exceed` decides what happens. |
-| `--kvmem-gen-exceed MODE` | `retrieval` (default) reswaps `budget + gen_reserve` once the reserve is full, which frees the reserve region and continues. `error` keeps the v1 stop and caps `max_tokens` at the reserve. The swap ranks this turn's blocks and older history on the same query score and stages out the losers. Kept before scoring: the `--kvmem-sink-tokens` prefix, the `--kvmem-recent-tokens` suffix, the query span, the incoming rows and the block being written. |
+| `--kvmem-gen-exceed MODE` | `retrieval` (default) reswaps `budget + gen_reserve` once the reserve is full, which frees the reserve region and continues; a request that omits `max_tokens` defaults to that whole pool. `error` keeps the v1 stop, caps `max_tokens` at the reserve and keeps the reserve as the omitted default. The swap ranks this turn's blocks and older history on the same query score and stages out the losers. Kept before scoring: the `--kvmem-sink-tokens` prefix, the `--kvmem-recent-tokens` suffix, the query span, the incoming rows and the block being written. |
 | `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Use `-ctk q8_0 -ctv q4_0` for mixed precision. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
@@ -197,8 +197,10 @@ Existing model, host/port, context, sampling, chat-template, vision and KV-cache
 flags remain available; run `--help` for the full supported list. `-n` / `--n-predict`
 now defaults to `-1`, matching llama-server: no additional output-token cap.
 Generation still stops at EOS/stop sequences and remains bounded by the available
-context and KVMem generation reserve; a request may set `max_tokens` explicitly.
-Other KVMem defaults
+context; the KVMem generation reserve bounds it as well under
+`--kvmem-gen-exceed error`. A request that omits `max_tokens` under the retrieval
+default uses the whole pool (`budget + gen_reserve`) as its output length; a
+request or `-n` may set it explicitly. Other KVMem defaults
 and `--kvmem-*` controls remain unchanged. Numeric arguments reject malformed and
 out-of-range values. Context size must be positive; `--n-predict` accepts `-1`
 or a positive number.
@@ -401,7 +403,7 @@ Pass the downloaded projector explicitly with `MMPROJ=/path/mmproj-Qwen3.8-27B-Q
 ```text
 -m Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf
 --mmproj mmproj-Qwen3.8-27B-Q5_K-MIX.gguf --no-mmproj-offload --image-max-tokens 512
--c 262144 -n 16384
+-c 262144
 --kvmem-budget 36864 --kvmem-gen-reserve 16384
 --kv-dtype q8_0
 --spec-type draft-mtp

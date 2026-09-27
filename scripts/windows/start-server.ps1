@@ -58,7 +58,7 @@ $visionFlag = '--mmproj-offload'
 if ($VisionDevice -eq 'cpu') { $visionFlag = '--no-mmproj-offload' }
 $serverArgs = @('-m', $Model, '--mmproj', $Mmproj, $visionFlag,
     '--image-max-tokens', '512', '--host', $ListenHost, '--port', "$Port",
-    '-c', '262144', '-n', "$reserve", '--kvmem-budget', "$budget", '--kvmem-gen-reserve', "$reserve",
+    '-c', '262144', '--kvmem-budget', "$budget", '--kvmem-gen-reserve', "$reserve",
     '--kv-dtype', $kv, '--spec-type', 'draft-mtp', '--spec-draft-n-max', "$Mtp",
     '--kvmem-block-tokens', "$BlockTokens", '--kvmem-query-policy', 'user',
     '--enable-thinking', '--reasoning-budget', "$ReasoningBudget")
