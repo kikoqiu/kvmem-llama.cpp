@@ -29,6 +29,9 @@ public:
     std::vector<std::pair<uint32_t, std::string>> media_identity() const;
     std::shared_ptr<kvmem_prompt> with_generated(const std::vector<llama_token> & gen) const;
     std::shared_ptr<kvmem_prompt> prefix(size_t rows) const;
+    // Matching/position metadata without the original image/audio tensors.
+    std::shared_ptr<kvmem_prompt> cache_index() const;
+    size_t index_bytes() const;
 private:
     std::shared_ptr<server_tokens> native_;
     std::map<size_t, llama_pos> position_offsets_ {{0, 0}};
@@ -36,7 +39,8 @@ private:
 
 class kvmem_vision {
 public:
-    kvmem_vision(llama_model * model, const std::string & path, bool gpu, int min_tokens, int max_tokens);
+    kvmem_vision(llama_model * model, const std::string & path, bool gpu,
+                 ggml_backend_dev_t device, int min_tokens, int max_tokens, int n_threads);
     ~kvmem_vision();
     std::shared_ptr<kvmem_prompt> tokenize(const std::string & prompt, const std::vector<std::vector<uint8_t>> & files);
     int decode(llama_context * ctx, const kvmem_prompt & prompt, size_t row, int n_batch,

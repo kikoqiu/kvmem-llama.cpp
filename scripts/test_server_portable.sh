@@ -6,7 +6,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 out=${1:-build/portable}
 mkdir -p "$out"
-includes=(-Itools -Isrc/adapter -Illama.cpp/include -Illama.cpp/ggml/include
+includes=(-Itools -Ikvmem/include -Isrc/adapter -Illama.cpp/include -Illama.cpp/ggml/include
           -Illama.cpp/common -Illama.cpp/vendor -Illama.cpp/vendor/cpp-httplib
           -Illama.cpp/tools/server -Illama.cpp/tools/mtmd)
 for test in server-options-test server-progress-test output-limit-test; do

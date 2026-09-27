@@ -7,6 +7,7 @@
 #include "llama-kvmem-capture.h"
 #include "llama-kvmem-factory.h"
 #include "llama-kvmem-hooks.h"
+#include "llama-kvmem-gpu.h"
 #include "llama-kvmem-quant.h"
 #include "llama-kvmem-stagein.h"
 #include "llama-kvmem-transfer.h"
@@ -19,12 +20,12 @@
 #include "llama-model.h"
 
 #include "llama.h"
+#include "kvmem/snapshot.hpp"
+#include "kvmem/snapshot_buffer.hpp"
 
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
-
-#include <cuda_runtime.h>
 
 #include <algorithm>
 #include <atomic>
@@ -32,28 +33,122 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <thread>
 
 static llama_kvmem_params g_kvmem_params = {};
 
 struct llama_memory_kvmem::GdnReplay {
-    ggml_backend_buffer_ptr descriptors;
-    cudaStream_t stream = nullptr;
-    int layers = 0;
-    int device = 0;
+    struct Group {
+        ggml_backend_buffer_ptr descriptors;
+        cudaStream_t stream = nullptr;
+        int layers = 0;
+        int device = -1;
+        ~Group() {
+            if (stream) {
+                cudaSetDevice(device);
+                cudaStreamSynchronize(stream);
+                cudaStreamDestroy(stream);
+            }
+        }
+    };
+    std::vector<std::unique_ptr<Group>> groups;
     uint64_t folds = 0;
     int64_t fold_us = 0;
-    ~GdnReplay() {
-        if (stream) {
-            cudaSetDevice(device);
-            cudaStreamSynchronize(stream);
-            cudaStreamDestroy(stream);
+};
+
+// One conversation's host KV. Moved out of the memory object at a store swap
+// and moved back in at the next one, so the object is never observable without
+// a store. KvMemRuntime owns NVMe prefetch futures and RawKvStore owns a mutex,
+// a condition variable and an io thread, so both travel as unique_ptr, which is
+// how they are already held.
+struct llama_memory_kvmem::ConvStore {
+    bool cold = false;
+    std::unique_ptr<kvmem::KvMemRuntime> runtime;
+    std::unique_ptr<kvmem::RawKvStore>   raw;
+    std::vector<RowPosition>             row_positions;
+    std::vector<std::vector<float>>      q_sum;
+    std::vector<uint32_t>                q_count;
+    // Follower mirror, swapped in lockstep: it is keyed by the trunk's block
+    // ids and is meaningless beside another conversation's store.
+    std::unique_ptr<kvmem::RawKvStore>   mtp_raw;
+    // Block ids that were GPU-resident at detach, ascending.
+    std::vector<uint32_t>                resident;
+};
+
+// Detached stores, keyed by an opaque handle. Handle 0 is the store the
+// constructor built, which is all a default server ever uses: the pool stays
+// empty until llama_kvmem_store_create() asks for a second one.
+struct kvmem_conv_entry {
+    int32_t id = 0;
+    // Null for the active handle: that store's members live on the memory
+    // object itself.
+    std::unique_ptr<llama_memory_kvmem::ConvStore> store;
+};
+
+struct kvmem_conv_pool {
+    llama_memory_kvmem * owner = nullptr;
+    std::vector<kvmem_conv_entry> entries;
+    int32_t active = 0;
+    int32_t next_id = 1;
+};
+
+static kvmem_conv_pool g_conv_pool;
+
+// ~KvMemRuntime does not drain start_prefetch's futures; only std::async's
+// blocking future destructor does. truncate_to(0) waits for them first. Every
+// path that drops a detached bundle goes through here: a bundle's runtime also
+// holds a KvMemBackend pointing at its owner's SlotBackend, so dropping one in
+// place after the owner changed would free against a stale backend.
+static void kvmem_conv_release(std::unique_ptr<llama_memory_kvmem::ConvStore> & store) {
+    if (!store) {
+        return;
+    }
+    if (store->runtime) {
+        store->runtime->truncate_to(0);
+    }
+    store.reset();
+}
+
+static void kvmem_conv_pool_unbind(llama_memory_kvmem * mem) {
+    if (g_conv_pool.owner != mem) {
+        return;
+    }
+    for (auto & e : g_conv_pool.entries) {
+        kvmem_conv_release(e.store);
+    }
+    g_conv_pool = kvmem_conv_pool{};
+}
+
+static kvmem_conv_pool * kvmem_conv_pool_bind(llama_memory_kvmem * mem) {
+    if (!mem) {
+        return nullptr;
+    }
+    if (g_conv_pool.owner != mem) {
+        // Reached only if a second memory object arms while an earlier one
+        // still holds detached bundles. Release them the way destroy and
+        // unbind do rather than dropping them where they lie; unbind() leaves
+        // the pool freshly default-constructed.
+        kvmem_conv_pool_unbind(g_conv_pool.owner);
+        g_conv_pool.owner = mem;
+        g_conv_pool.entries.emplace_back();
+    }
+    return &g_conv_pool;
+}
+
+static kvmem_conv_entry * kvmem_conv_find(int32_t id) {
+    for (auto & e : g_conv_pool.entries) {
+        if (e.id == id) {
+            return &e;
         }
     }
-};
+    return nullptr;
+}
 
 void llama_memory_kvmem::set_recurrent(llama_memory_recurrent * recr) {
     recr_ = recr;
@@ -69,32 +164,54 @@ void llama_memory_kvmem::set_recurrent(llama_memory_recurrent * recr) {
             (recurrent_bytes + conv_bytes) / planes * (planes - 1));
     if (!recr->replay_capacity) return;
     auto replay = std::make_unique<GdnReplay>();
-    std::vector<ggml_cuda_gdn_replay_layer> layers;
-    size_t records = 0, states = 0;
-    ggml_backend_buffer_type_t buft = nullptr;
+    struct GroupBuild {
+        std::vector<ggml_cuda_gdn_replay_layer> layers;
+        ggml_backend_buffer_type_t buft = nullptr;
+        size_t states = 0;
+        size_t records = 0;
+    };
+    std::map<int, GroupBuild> grouped;
     for (size_t il = 0; il < recr->r_l.size(); ++il) {
         if (!recr->r_l[il]) continue;
         const auto & r = recr->replay_l[il];
-        layers.push_back({static_cast<float *>(recr->s_l[il]->data), static_cast<float *>(recr->r_l[il]->data),
+        ggml_cuda_gdn_replay_layer layer = {static_cast<float *>(recr->s_l[il]->data), static_cast<float *>(recr->r_l[il]->data),
                 static_cast<float *>(r[0]->data), static_cast<float *>(r[1]->data), static_cast<float *>(r[2]->data),
-                static_cast<float *>(r[3]->data), static_cast<float *>(r[4]->data)});
-        for (auto * t : r) records += ggml_nbytes(t);
-        states += ggml_nbytes(recr->r_l[il]) + ggml_nbytes(recr->s_l[il]);
-        buft = ggml_backend_buffer_get_type(recr->s_l[il]->buffer);
+                static_cast<float *>(r[3]->data), static_cast<float *>(r[4]->data)};
+        const void * ptrs[] = {layer.state, layer.conv, layer.key, layer.value, layer.gate, layer.beta, layer.conv_input};
+        int device = -1;
+        for (const void * ptr : ptrs) {
+            cudaPointerAttributes attrs{};
+            if (!ptr || cudaPointerGetAttributes(&attrs, ptr) != cudaSuccess || attrs.type != cudaMemoryTypeDevice ||
+                    (device >= 0 && device != attrs.device)) {
+                throw std::runtime_error("GDN replay layer has missing or cross-device state/record tensors");
+            }
+            device = attrs.device;
+        }
+        auto & group = grouped[device];
+        group.layers.push_back(layer);
+        for (auto * t : r) group.records += ggml_nbytes(t);
+        group.states += ggml_nbytes(recr->r_l[il]) + ggml_nbytes(recr->s_l[il]);
+        if (!group.buft) group.buft = ggml_backend_buffer_get_type(recr->s_l[il]->buffer);
     }
-    if (layers.empty()) throw std::runtime_error("GDN replay has no recurrent layers");
-    cudaPointerAttributes attrs{};
-    if (cudaPointerGetAttributes(&attrs, layers.front().state) != cudaSuccess ||
-            cudaSetDevice(attrs.device) != cudaSuccess) throw std::runtime_error("cannot select GDN replay device");
-    replay->device = attrs.device;
-    replay->layers = layers.size();
-    replay->descriptors.reset(ggml_backend_buft_alloc_buffer(buft, layers.size() * sizeof(layers[0])));
-    if (!replay->descriptors || cudaStreamCreateWithFlags(&replay->stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaMemcpy(ggml_backend_buffer_get_base(replay->descriptors.get()), layers.data(), layers.size() * sizeof(layers[0]), cudaMemcpyHostToDevice) != cudaSuccess) {
-        throw std::runtime_error("cannot allocate GDN replay descriptors");
+    if (grouped.empty()) throw std::runtime_error("GDN replay has no recurrent layers");
+    for (auto & [device, build] : grouped) {
+        auto group = std::make_unique<GdnReplay::Group>();
+        group->device = device;
+        group->layers = static_cast<int>(build.layers.size());
+        const size_t descriptor_bytes = build.layers.size() * sizeof(build.layers[0]);
+        if (cudaSetDevice(device) != cudaSuccess) throw std::runtime_error("cannot select GDN replay device");
+        group->descriptors.reset(ggml_backend_buft_alloc_buffer(build.buft, descriptor_bytes));
+        cudaPointerAttributes attrs{};
+        const void * dst = group->descriptors ? ggml_backend_buffer_get_base(group->descriptors.get()) : nullptr;
+        if (!dst || cudaPointerGetAttributes(&attrs, dst) != cudaSuccess || attrs.device != device ||
+                cudaStreamCreateWithFlags(&group->stream, cudaStreamNonBlocking) != cudaSuccess ||
+                cudaMemcpy(const_cast<void *>(dst), build.layers.data(), descriptor_bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            throw std::runtime_error("cannot allocate GDN replay descriptors on their layer GPU");
+        }
+        kvmem_diag("KVMEM_GDN_MEMORY mode=replay device=%d layers=%d capacity=%u state_bytes=%zu record_bytes=%zu descriptor_bytes=%zu\n",
+                device, group->layers, recr->replay_capacity, build.states, build.records, descriptor_bytes);
+        replay->groups.push_back(std::move(group));
     }
-    kvmem_diag("KVMEM_GDN_MEMORY mode=replay layers=%d capacity=%u state_bytes=%zu record_bytes=%zu descriptor_bytes=%zu\n",
-            replay->layers, recr->replay_capacity, states, records, layers.size() * sizeof(layers[0]));
     gdn_replay_ = std::move(replay);
 }
 
@@ -111,10 +228,21 @@ bool llama_memory_kvmem::gdn_replay_commit(llama_context * ctx, uint32_t n_keep)
     llama_synchronize(ctx);
     auto & replay = *gdn_replay_;
     const int64_t started = ggml_time_us();
-    const auto * layers = static_cast<const ggml_cuda_gdn_replay_layer *>(ggml_backend_buffer_get_base(replay.descriptors.get()));
-    if (cudaSetDevice(replay.device) != cudaSuccess ||
-            !ggml_backend_cuda_gdn_fold(layers, replay.layers, n_keep, recr_->replay_capacity, replay.stream) ||
-            cudaStreamSynchronize(replay.stream) != cudaSuccess) {
+    std::vector<GdnReplay::Group *> launched;
+    bool ok = true;
+    for (const auto & group : replay.groups) {
+        const auto * layers = static_cast<const ggml_cuda_gdn_replay_layer *>(ggml_backend_buffer_get_base(group->descriptors.get()));
+        if (cudaSetDevice(group->device) != cudaSuccess ||
+                !ggml_backend_cuda_gdn_fold(layers, group->layers, n_keep, recr_->replay_capacity, group->stream)) {
+            ok = false;
+            break;
+        }
+        launched.push_back(group.get());
+    }
+    for (auto * group : launched) {
+        if (cudaSetDevice(group->device) != cudaSuccess || cudaStreamSynchronize(group->stream) != cudaSuccess) ok = false;
+    }
+    if (!ok) {
         recr_->replay_poisoned = true;
         recr_->replay_finish(0);
         return false;
@@ -186,6 +314,23 @@ struct llama_memory_kvmem::CaptureD2hPipe {
     bool ok = false;
 };
 
+struct llama_memory_kvmem::MultiD2hPipe {
+    struct Device {
+        int id = -1;
+        cudaStream_t stream = nullptr;
+        uint8_t * pin = nullptr;
+        size_t cap = 0;
+        size_t used = 0;
+    };
+    struct Item {
+        CaptureD2hPipe::Item capture;
+        size_t device = 0;
+        const uint8_t * src = nullptr;
+    };
+    std::vector<Device> devices;
+    std::vector<Item> items;
+};
+
 static bool kvmem_cuda_ok(cudaError_t e, const char * what) {
     if (e == cudaSuccess) {
         return true;
@@ -199,7 +344,7 @@ static uint8_t * kvmem_cuda_tensor_ptr(ggml_tensor * t) {
         return nullptr;
     }
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
-    if (!buf || ggml_backend_buffer_is_host(buf)) {
+    if (!buf || ggml_backend_buffer_is_host(buf) || ggml_backend_buffer_is_meta(buf)) {
         return nullptr;
     }
     return static_cast<uint8_t *>(t->data);
@@ -399,10 +544,75 @@ struct kvmem_pool_plan {
     uint64_t gpu_total = 0;
 };
 
+static bool kvmem_tensor_multi_gpu(const llama_model & model) {
+    return model.split_mode() == LLAMA_SPLIT_MODE_TENSOR && model.get_split_state_ud.n_devices > 1;
+}
+
+static std::vector<ggml_backend_dev_t> kvmem_tensor_devices(const llama_model & model) {
+    if (model.devices.size() != 1) throw std::runtime_error("tensor model has no unique Meta device");
+    auto * meta = model.devices[0].dev;
+    if (ggml_backend_dev_type(meta) != GGML_BACKEND_DEVICE_TYPE_META) {
+        throw std::runtime_error("tensor model device is not Meta");
+    }
+    const size_t count = ggml_backend_meta_device_count(meta);
+    if (count != model.get_split_state_ud.n_devices) {
+        throw std::runtime_error("tensor Meta physical GPU count does not match split metadata");
+    }
+    std::vector<ggml_backend_dev_t> result;
+    for (size_t i = 0; i < count; ++i) {
+        auto * dev = ggml_backend_meta_device_get(meta, i);
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU ||
+                std::string(ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev))) != "CUDA" ||
+                std::find(result.begin(), result.end(), dev) != result.end()) {
+            throw std::runtime_error("tensor Meta physical GPU list is invalid");
+        }
+        result.push_back(dev);
+    }
+    return result;
+}
+
+static std::vector<uint64_t> kvmem_tensor_kv_row_bytes(
+        const llama_model & model, ggml_type type_k, ggml_type type_v, bool include_mtp) {
+    const size_t n_devices = model.get_split_state_ud.n_devices;
+    std::vector<uint64_t> bytes(n_devices, 0);
+    const uint32_t n_layers = include_mtp ? model.hparams.n_layer_all : model.hparams.n_layer();
+    ggml_init_params ip = {
+        /*.mem_size   =*/ 2 * n_layers * ggml_tensor_overhead() + 1024,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    ggml_context_ptr ctx{ggml_init(ip)};
+    if (!ctx) throw std::runtime_error("cannot allocate tensor KV split metadata");
+    for (uint32_t il = 0; il < n_layers; ++il) {
+        if (model.hparams.is_recr(il) || !model.hparams.has_kv(il)) continue;
+        for (bool is_k : {true, false}) {
+            // The draft context can choose a wider cache type than the target.
+            const ggml_type type = il >= model.hparams.n_layer() ? GGML_TYPE_F32 : is_k ? type_k : type_v;
+            const uint32_t dim = is_k ? model.hparams.n_embd_k_gqa(il) : model.hparams.n_embd_v_gqa(il);
+            ggml_tensor * t = ggml_new_tensor_2d(ctx.get(), type, dim, 1);
+            ggml_format_name(t, "cache_%c_l%u", is_k ? 'k' : 'v', il);
+            auto * ud = const_cast<llama_meta_device_get_split_state_userdata *>(&model.get_split_state_ud);
+            const auto split = llama_meta_device_get_split_state(t, ud);
+            if (split.axis != GGML_BACKEND_SPLIT_AXIS_0 || split.n_segments != 1 || split.nr[0] != 1) {
+                throw std::runtime_error("unsupported tensor KV split layout for KVMem pool planning");
+            }
+            for (size_t j = 0; j < n_devices; ++j) {
+                const int64_t shard_dim = split.ne[j];
+                if (shard_dim < 0 || shard_dim % ggml_blck_size(type) != 0) {
+                    throw std::runtime_error("tensor KV split is incompatible with the selected cache type");
+                }
+                if (shard_dim > 0) bytes[j] += ggml_row_size(type, shard_dim);
+            }
+        }
+    }
+    return bytes;
+}
+
 static kvmem_pool_plan kvmem_compute_pool(
         const llama_model & model,
         const llama_memory_params & params,
-        const llama_cparams & cparams) {
+        const llama_cparams & cparams,
+        uint32_t borrowed_kv_size = 0) {
     kvmem_pool_plan p;
     p.block_tokens = g_kvmem_params.block_tokens ? g_kvmem_params.block_tokens : 32u;
     uint32_t budget = g_kvmem_params.budget;
@@ -438,6 +648,109 @@ static kvmem_pool_plan kvmem_compute_pool(
         p.cap_blocks = static_cast<uint32_t>(usable / std::max(p.block_bytes, uint64_t{1}));
     }
 
+    // A layer split has one common token window, but each GPU stores only the
+    // KV of its own layers. The smallest per-device capacity bounds that window.
+    std::map<ggml_backend_dev_t, uint64_t> bytes_per_token;
+    std::map<ggml_backend_dev_t, uint64_t> mtp_state_bytes;
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        auto * dev = model.dev_layer(static_cast<int>(il));
+        if (!dev || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) continue;
+        if (model.hparams.is_recr(il)) {
+            if (cparams.n_rs_seq > 0) {
+                const uint64_t state = static_cast<uint64_t>(model.hparams.n_embd_r() + model.hparams.n_embd_s()) * sizeof(float);
+                // Match the five FP32 ReplaySSM record widths in llama_memory_recurrent.
+                const uint64_t records = static_cast<uint64_t>(2048 + 6144 + 48 + 48 + 10240) *
+                        sizeof(float) * (1 + cparams.n_rs_seq);
+                mtp_state_bytes[dev] += g_kvmem_params.mtp_state == 2 ? state + records : state * (1 + cparams.n_rs_seq);
+            }
+            continue;
+        }
+        bytes_per_token[dev] += ggml_row_size(params.type_k, model.hparams.n_embd_k_gqa(il))
+                              + ggml_row_size(params.type_v, model.hparams.n_embd_v_gqa(il));
+    }
+    ggml_backend_dev_t mtp_owner = nullptr;
+    uint64_t mtp_row_bytes = 0;
+    if (cparams.n_rs_seq > 0 && model.hparams.n_layer_nextn > 0) {
+        const uint32_t il = model.hparams.n_layer();
+        mtp_owner = model.dev_layer(static_cast<int>(il));
+        mtp_row_bytes = static_cast<uint64_t>(model.hparams.n_layer_nextn) *
+                (ggml_row_size(GGML_TYPE_F32, model.hparams.n_embd_k_gqa(il)) +
+                 ggml_row_size(GGML_TYPE_F32, model.hparams.n_embd_v_gqa(il)));
+        if (mtp_owner && ggml_backend_dev_type(mtp_owner) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            bytes_per_token.try_emplace(mtp_owner, 0);
+        }
+    }
+    if (kvmem_tensor_multi_gpu(model) && borrowed_kv_size == 0) {
+        const auto rows = kvmem_tensor_kv_row_bytes(model, params.type_k, params.type_v, cparams.n_rs_seq > 0);
+        const auto devices = kvmem_tensor_devices(model);
+        uint64_t state_reserve = 0;
+        if (cparams.n_rs_seq > 0) {
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (model.hparams.is_recr(il)) {
+                    state_reserve += static_cast<uint64_t>(model.hparams.n_embd_r() + model.hparams.n_embd_s()) *
+                                     sizeof(float) * (1 + cparams.n_rs_seq);
+                }
+            }
+        }
+        p.gpu_total = 0;
+        uint64_t cap = UINT64_MAX;
+        for (size_t j = 0; j < rows.size(); ++j) {
+            auto * dev = devices[j];
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            // Reserve the whole snapshot state on each card as a safe upper bound
+            // until per-shard recurrent memory accounting is exposed by Meta.
+            const uint64_t reserve = std::max<uint64_t>(256ull << 20, free_bytes / 10) + state_reserve;
+            const uint64_t free_for_kv = free_bytes > reserve ? free_bytes - reserve : 0;
+            const uint64_t kv_budget = std::min<uint64_t>(free_for_kv, total_bytes * ratio);
+            const uint64_t device_cap = rows[j] ? kv_budget / (rows[j] * p.block_tokens) : UINT64_MAX;
+            LLAMA_LOG_INFO("%s: tensor KV device=%s free=%zu total=%zu row_bytes=%llu state_reserve=%llu cap_blocks=%llu\n",
+                    __func__, ggml_backend_dev_name(dev), free_bytes, total_bytes,
+                    (unsigned long long) rows[j], (unsigned long long) state_reserve,
+                    (unsigned long long) device_cap);
+            cap = std::min(cap, device_cap);
+        }
+        if (cap < 2) throw std::runtime_error("tensor KV pool cannot fit a working block plus generation reserve");
+        p.cap_blocks = static_cast<uint32_t>(std::min<uint64_t>(cap, UINT32_MAX));
+        if (g_kvmem_params.budget &&
+                static_cast<uint64_t>(budget) + gen_reserve > cap * p.block_tokens) {
+            throw std::runtime_error("requested KVMem budget plus generation reserve exceeds a tensor GPU KV capacity");
+        }
+    } else if (model.n_devices() > 1 && !bytes_per_token.empty() && borrowed_kv_size == 0) {
+        p.gpu_total = 0; // the per-device limits below replace a first-GPU total
+        uint64_t cap = UINT64_MAX;
+        for (const auto & [dev, row_bytes] : bytes_per_token) {
+            size_t free_bytes = 0, total_bytes = 0;
+            ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            // free_bytes is queried after model weights load. Leave headroom
+            // for the scheduler graph and staging buffers on every device.
+            const uint64_t mtp_fixed = mtp_state_bytes[dev] + (cparams.n_rs_seq > 0 ? 128ull << 20 : 0);
+            const uint64_t reserve = std::max<uint64_t>(256ull << 20, free_bytes / 10) + mtp_fixed;
+            const uint64_t free_for_kv = free_bytes > reserve ? free_bytes - reserve : 0;
+            const uint64_t ratio_budget = static_cast<uint64_t>(total_bytes * ratio);
+            const uint64_t kv_budget = std::min(free_for_kv, ratio_budget);
+            const uint64_t planned_row = row_bytes + (dev == mtp_owner ? mtp_row_bytes : 0);
+            const uint64_t device_cap = planned_row ? kv_budget / (planned_row * p.block_tokens) : UINT64_MAX;
+            LLAMA_LOG_INFO("%s: layer KV device=%s free=%zu total=%zu row_bytes=%llu mtp_row_bytes=%llu mtp_state_reserve=%llu cap_blocks=%llu\n",
+                    __func__, ggml_backend_dev_name(dev), free_bytes, total_bytes,
+                    (unsigned long long) row_bytes, (unsigned long long) (dev == mtp_owner ? mtp_row_bytes : 0),
+                    (unsigned long long) mtp_fixed, (unsigned long long) device_cap);
+            cap = std::min(cap, device_cap);
+        }
+        if (cap < 2) throw std::runtime_error("multi-GPU layer KV pool cannot fit a working block plus generation reserve on every owning GPU");
+        p.cap_blocks = static_cast<uint32_t>(std::min<uint64_t>(cap, UINT32_MAX));
+        if (g_kvmem_params.budget &&
+                static_cast<uint64_t>(budget) + gen_reserve > cap * p.block_tokens) {
+            throw std::runtime_error("requested KVMem budget plus generation reserve exceeds a layer GPU KV capacity");
+        }
+    } else if (borrowed_kv_size > 0) {
+        // Hybrid models allocate the attention cache before constructing this
+        // adapter. Reuse its committed capacity instead of subtracting that
+        // allocation from free VRAM and planning a smaller cache a second time.
+        p.gpu_total = 0;
+        p.cap_blocks = borrowed_kv_size / p.block_tokens;
+    }
+
     uint32_t pool = budget + gen_reserve;
     if (pool > cparams.n_ctx_seq && g_kvmem_params.budget == 0) {
         pool = cparams.n_ctx_seq;
@@ -462,7 +775,7 @@ static kvmem_pool_plan kvmem_compute_pool(
     }
     p.budget = budget;
     p.gen_reserve = gen_reserve;
-    p.kv_size = std::max(pool, 1u);
+    p.kv_size = borrowed_kv_size ? borrowed_kv_size : std::max(pool, 1u);
     p.n_slots = (p.kv_size + p.block_tokens - 1) / p.block_tokens;
     if (p.n_slots * p.block_tokens < p.kv_size) {
         p.n_slots += 1;
@@ -531,16 +844,20 @@ llama_memory_kvmem::llama_memory_kvmem(
     retr_.enabled = perf_.enabled;
     harvest_perf_emit_graph_line();
 
-    const kvmem_pool_plan pool = kvmem_compute_pool(model, params, cparams);
+    const kvmem_pool_plan pool = kvmem_compute_pool(
+            model, params, cparams,
+            ext_kv && (model.n_devices() > 1 || kvmem_tensor_multi_gpu(model)) ? ext_kv->get_size() : 0);
     block_tokens_ = pool.block_tokens;
     kv_size_ = pool.kv_size;
     n_slots_ = pool.n_slots;
 
-    auto rt_cfg = make_runtime_cfg(
+    // Both store configs are kept as members so a sibling store for another
+    // conversation is configured identically.
+    rt_cfg_ = make_runtime_cfg(
             block_tokens_, pool.budget, g_kvmem_params.sink_tokens, g_kvmem_params.recent_tokens,
             pool.block_bytes);
-    rt_cfg.store.estimated_gpu_block_capacity = pool.cap_blocks;
-    runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg, &backend_);
+    rt_cfg_.store.estimated_gpu_block_capacity = pool.cap_blocks;
+    runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_, &backend_);
 
     if (ext_kv) {
         kv_ = ext_kv;
@@ -571,8 +888,46 @@ llama_memory_kvmem::llama_memory_kvmem(
                 nullptr,
                 nullptr,
                 nullptr,
-                "kvmem");
+                kvmem_tensor_multi_gpu(model) ? "" : "kvmem");
         kv_ = kv_owned_.get();
+    }
+
+    std::set<ggml_backend_dev_t> kv_owners;
+    for (uint32_t il : kv_->get_layer_ids()) {
+        auto * expected = model.dev_layer(static_cast<int>(il));
+        if (kvmem_tensor_multi_gpu(model)) {
+            for (ggml_tensor * t : {kv_->get_k_storage(static_cast<int32_t>(il)),
+                                    kv_->get_v_storage(static_cast<int32_t>(il))}) {
+                if (!t) continue;
+                auto * buffer = t->buffer ? t->buffer : t->view_src ? t->view_src->buffer : nullptr;
+                if (!ggml_backend_buffer_is_meta(buffer)) {
+                    throw std::runtime_error("tensor split requires Meta attention KV buffers");
+                }
+            }
+        } else if (model.n_devices() > 1) {
+            for (ggml_tensor * t : {kv_->get_k_storage(static_cast<int32_t>(il)),
+                                    kv_->get_v_storage(static_cast<int32_t>(il))}) {
+                if (!t) continue;
+                auto * buffer = t->buffer ? t->buffer : t->view_src ? t->view_src->buffer : nullptr;
+                auto * actual = buffer ? ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buffer)) : nullptr;
+                if (actual != expected) {
+                    throw std::runtime_error("multi-GPU layer requires every attention KV tensor on its model layer's GPU");
+                }
+            }
+        }
+        if (expected && ggml_backend_dev_type(expected) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            kv_owners.insert(expected);
+        }
+    }
+    multi_gpu_ = model.n_devices() > 1 || kvmem_tensor_multi_gpu(model);
+    if (multi_gpu_) {
+        if (kvmem_tensor_multi_gpu(model)) {
+            LLAMA_LOG_INFO("%s: synchronous tensor KV path across %zu physical GPUs\n",
+                           __func__, model.get_split_state_ud.n_devices);
+        } else {
+            LLAMA_LOG_INFO("%s: synchronous layer KV path across %zu selected GPUs (%zu attention owners)\n",
+                           __func__, model.n_devices(), kv_owners.size());
+        }
     }
 
     reset_slots();
@@ -598,7 +953,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     query_begin_ = g_kvmem_params.query_begin;
     query_end_ = g_kvmem_params.query_end;
     force_pos_ = g_kvmem_params.force_pos;
-    kvmem::RawKvStoreConfig rcfg;
+    kvmem::RawKvStoreConfig & rcfg = raw_cfg_;
     rcfg.n_layer = n_layer_;
     rcfg.n_embd_k = n_embd_k_;
     rcfg.n_embd_v = n_embd_v_;
@@ -635,7 +990,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     LLAMA_LOG_INFO(
             "%s: KVMem slot-pool cells=%u slots=%u block_tokens=%u budget=%u gen_reserve=%u sink_blocks=%u method=%s prefill=%s gen_exceed=%s harvest_v=%d type_k=%s type_v=%s n_embd_k=%u attn_layers=%u%s\n",
             __func__, kv_size_, n_slots_, block_tokens_, pool.budget, pool.gen_reserve,
-            rt_cfg.store.sink_blocks,
+            rt_cfg_.store.sink_blocks,
             method_ == 1 ? "retrieval" : "recency",
             prefill_method_ == 1 ? "retrieval" : "recency",
             gen_exceed_ == 1 ? "retrieval" : "error",
@@ -646,9 +1001,9 @@ llama_memory_kvmem::llama_memory_kvmem(
     kvmem_diag("KVMEM_KV_BYTES bytes=%zu cells=%u slots=%u budget=%u pool=%u "
             "ratio=%.2f high=%.2f low=%.2f cap_blocks=%u gpu_total=%llu block_bytes=%llu\n",
             kv_bytes, kv_size_, n_slots_, pool.budget, kv_size_,
-            rt_cfg.store.gpu_memory_ratio,
-            rt_cfg.store.gpu_high_watermark,
-            rt_cfg.store.gpu_low_watermark,
+            rt_cfg_.store.gpu_memory_ratio,
+            rt_cfg_.store.gpu_high_watermark,
+            rt_cfg_.store.gpu_low_watermark,
             pool.cap_blocks,
             (unsigned long long) pool.gpu_total,
             (unsigned long long) pool.block_bytes);
@@ -662,11 +1017,13 @@ llama_memory_kvmem::~llama_memory_kvmem() {
     harvest_worker_stop();
     harvest_perf_print_sum();
     d2h_free();
-    kvmem_stagein_gpu_free();
+    multi_d2h_free();
+    if (!multi_gpu_) kvmem_stagein_gpu_free();
     if (mtp_) {
         mtp_->detach_target();
         mtp_ = nullptr;
     }
+    kvmem_conv_pool_unbind(this);
     kvmem_capture_unbind(this);
 }
 
@@ -678,11 +1035,18 @@ void llama_memory_kvmem::reset_slots() {
     }
 }
 
-void llama_memory_kvmem::reset_policy() {
-    ++attention_epoch_;
+void llama_memory_kvmem::reset_turn_policy() {
     explicit_spans_ = false;
     query_frozen_ = false;
     turn_spans_ = {};
+    retrieval_pinned_ = false;
+    keep_selected_ = false;
+    prefill_capture_ = true;
+}
+
+void llama_memory_kvmem::reset_policy() {
+    ++attention_epoch_;
+    reset_turn_policy();
     row_positions_.clear();
     decode_mean_reset();
     reset_query_acc();
@@ -692,10 +1056,8 @@ void llama_memory_kvmem::reset_policy() {
     if (runtime_) {
         runtime_->truncate_to(0);
     }
+    host_mirror_stale_ = false;
     reset_slots();
-    retrieval_pinned_ = false;
-    keep_selected_ = false;
-    prefill_capture_ = true;
 }
 
 void llama_memory_kvmem::begin_cached_turn(bool reset_query) {
@@ -712,6 +1074,8 @@ void llama_memory_kvmem::begin_cached_turn(bool reset_query) {
 }
 
 void llama_memory_kvmem::truncate_cached(uint32_t n_past) {
+    // Keyed off the block table alone, so it cannot reach a host mirror the
+    // full-seq_rm branch left behind: see host_mirror_stale_ there.
     if (runtime_ && n_past >= runtime_->store().total_tokens()) return;
     ++attention_epoch_;
     harvest_flush();
@@ -736,6 +1100,600 @@ void llama_memory_kvmem::set_replay(bool replay) {
         if (mtp_) mtp_->invalidate_packed_from(begin);
     }
     replay_ = replay;
+}
+
+bool llama_memory_kvmem::conv_swap_supported(std::string & reason) const {
+    if (!runtime_ || !raw_ || !kv_) {
+        reason = "no_store";
+        return false;
+    }
+    // Without flash attention V is never mirrored to host: harvest_gpu_v
+    // returns immediately and RawKvStoreConfig::v_gpu_row_bytes stays 0, so a
+    // drained conversation could not be restaged. A swap drains everything on
+    // every switch, so refuse to arm instead of restaging stale V.
+    if (v_trans_) {
+        reason = "v_trans";
+        return false;
+    }
+    // Each RawKvStore opens its own arena, sized for one conversation and named
+    // by a fixed nvme_file.
+    if (g_kvmem_params.raw_k_nvme) {
+        reason = "raw_k_nvme";
+        return false;
+    }
+    return true;
+}
+
+bool llama_memory_kvmem::conv_can_drain(std::string & reason) const {
+    // A replay hole is described by the GPU snapshot planes and the fold
+    // window, neither of which the server's recurrent byte dump covers.
+    if (replay_) {
+        reason = "replay_in_flight";
+        return false;
+    }
+    if (recr_ && recr_->replay_recording) {
+        reason = "gdn_replay_recording";
+        return false;
+    }
+    // A prepared-but-unapplied plan would strand pending_gpu_frees_. Requests
+    // are serialized and every prepare is applied in the same request, so this
+    // should never fire.
+    if (runtime_ && runtime_->pending()) {
+        reason = "plan_pending";
+        return false;
+    }
+    // The host mirror no longer describes the block table (see seq_rm), so its
+    // packed K/V cannot be trusted to restage this conversation.
+    if (host_mirror_stale_) {
+        reason = "host_mirror_stale";
+        return false;
+    }
+    return true;
+}
+
+std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::make_conv() {
+    auto conv = std::make_unique<ConvStore>();
+    conv->runtime = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_, &backend_);
+    conv->raw = std::make_unique<kvmem::RawKvStore>(raw_cfg_);
+    conv->q_sum.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
+    conv->q_count.assign(n_layer_, 0);
+    if (mtp_) {
+        conv->mtp_raw = mtp_->make_raw();
+    }
+    return conv;
+}
+
+uint32_t llama_memory_kvmem::conv_n_tokens(const ConvStore & conv) const {
+    return conv.runtime ? conv.runtime->store().total_tokens() : 0;
+}
+
+uint64_t llama_memory_kvmem::conv_host_bytes(const ConvStore & conv) const {
+    if (!conv.raw) {
+        return 0;
+    }
+    uint64_t bytes = conv.raw->allocated_bytes() + (conv.mtp_raw ? conv.mtp_raw->allocated_bytes() : 0);
+    bytes += conv.runtime->allocated_bytes() + conv.row_positions.capacity()*sizeof(RowPosition);
+    bytes += conv.q_count.capacity()*sizeof(uint32_t) + conv.resident.capacity()*sizeof(uint32_t);
+    bytes += conv.q_sum.capacity()*sizeof(std::vector<float>);
+    for (const auto & q : conv.q_sum) bytes += q.capacity()*sizeof(float);
+    return bytes;
+}
+
+uint64_t llama_memory_kvmem::host_bytes() const {
+    if (!raw_) {
+        return 0;
+    }
+    uint64_t bytes = raw_->allocated_bytes() + (mtp_ ? mtp_->host_bytes() : 0);
+    bytes += runtime_->allocated_bytes() + row_positions_.capacity()*sizeof(RowPosition);
+    bytes += q_count_.capacity()*sizeof(uint32_t);
+    bytes += q_sum_.capacity()*sizeof(std::vector<float>);
+    for (const auto & q : q_sum_) bytes += q.capacity()*sizeof(float);
+    return bytes;
+}
+
+uint64_t llama_memory_kvmem::host_capacity(uint32_t tokens) const {
+    // Bound retained checkpoints as well as raw KV. A single sequence writes
+    // one logical recurrent row, irrespective of GPU rollback plane count.
+    uint64_t checkpoint = 65536;
+    if (recr_) {
+        for (const auto * list : { &recr_->r_l, &recr_->s_l, &recr_->p_l })
+            for (const auto * t : *list) if (t) checkpoint += ggml_row_size(t->type, t->ne[0]);
+    } else {
+        // Dense memory does not implement PARTIAL_ONLY: its server checkpoint
+        // contains the attention working set and cell metadata.
+        for (const auto & buffer : kv_->memory_breakdown()) checkpoint += buffer.second;
+        checkpoint += uint64_t(kv_size_)*64;
+    }
+    checkpoint += uint64_t(n_layer_)*(n_embd_k_ + uint64_t(n_head_)*n_embd_head_)*sizeof(float);
+    // MTP carry, token/prompt indexes, query state and bounded allocator slack.
+    return 8*checkpoint + 8*1024*1024 + uint64_t(tokens)*64 +
+        raw_->capacity_bytes(tokens, uint32_t(kv_->get_layer_ids().size())) + (mtp_ ? mtp_->capacity_bytes(tokens) : 0) +
+        uint64_t(tokens)*sizeof(RowPosition)*2 +
+        ((uint64_t(tokens)/block_tokens_) + 2)*sizeof(kvmem::KvMemBlock)*2;
+}
+
+std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::detach_conv() {
+    // Quiesce every writer of raw_, q_sum_ and the GPU cells before either
+    // moves. The order matters and each step closes a different queue:
+    //
+    // 1. The stage-in slab is a process global holding packed K/V aimed at
+    //    cells this store still owns. Land it here, or the incoming store's
+    //    first flush would write these bytes into its own cells.
+    // 2. decode_mean_reset() writes the partial-block running mean into raw_
+    //    and sets decode_mean_block_ = ~0u, which makes the incoming
+    //    conversation take decode_mean_add_range()'s block-change branch and
+    //    zero the process-global mean-K accumulator. decode_mean_print_sum()
+    //    is deliberately not called: it latches once per process.
+    // 3. harvest_flush() waits for the harvest worker queue and both
+    //    CaptureD2hPipe slots under harvest_w_->mu. That mutex is also the
+    //    release/acquire edge for the worker's last write to raw_ and q_sum_
+    //    through this, so the wait must happen even when the pipe looks idle:
+    //    skipping it is a data race on vectors that are about to be moved.
+    //    The pipe itself is kept, as in the destructor's ordering; d2h_free()
+    //    would drop engine-sized staging buffers a swap does not change.
+    // 4. harvest_gpu_v_commit() drains the stage-out slab into raw_ and clears
+    //    harvest_gpu_queued_, but it does not wait for the store's own writes.
+    //    The three existing call sites get away with that only because each
+    //    ends in a raw_ mutation (truncate_to / invalidate_packed_from /
+    //    clear) that waits first. A detach mutates nothing, so it waits here.
+    // The harvest worker is drained, never stopped: after the wait it parks in
+    // harvest_loop() holding no reference to raw_, q_sum_ or cur_pos_.
+    kvmem_stagein_flush_sync(nullptr, nullptr, nullptr, nullptr);
+    decode_mean_reset();
+    harvest_flush();
+    harvest_gpu_v_commit();
+    if (raw_) {
+        raw_->wait_writes();
+    }
+    if (mtp_) {
+        mtp_->harvest_flush();
+    }
+    // The one condition that would corrupt the store being moved: a slot still
+    // in flight means the worker can still call harvest_from_host() and write
+    // raw_ and q_sum_ through this. harvest_flush() rules it out, both by
+    // waiting on the worker and by committing synchronously without one, so
+    // this waits rather than only warning: a warning that walks into the
+    // hazard it names reads as covered and is not.
+    if (d2h_) {
+        for (int slot = 0; slot < 2; ++slot) {
+            if (!d2h_->slots[slot].inflight) {
+                continue;
+            }
+            LLAMA_LOG_WARN("%s: KVMem capture pipe slot %d still in flight at a store detach\n",
+                    __func__, slot);
+            harvest_wait_slot(slot);
+        }
+    }
+    // Rows of the outgoing conversation. An unconsumed ubatch note would make
+    // the incoming conversation's first harvest write to this conversation's
+    // rows, and cur_pos_ is what harvest_from_host() stamps onto them.
+    // prepare_ubatches() refills pos_queue_ on every init_batch, so dropping
+    // it here costs the incoming conversation nothing.
+    //
+    // pending_capture_ and graph_has_* are deliberately left alone: they
+    // describe the llama_context's cached graph, which a swap does not
+    // rebuild. capture_on_new_graph() owns them, harvest_pending() needs
+    // pending_capture_ to survive a reused graph, and capture_can_reuse()
+    // compares graph_has_q_/graph_has_k_ against that same graph.
+    if (!pos_queue_.empty()) {
+        kvmem_diag("KVMEM_STORE_DETACH_PENDING posq=%zu capture=%zu\n",
+                pos_queue_.size(), pending_capture_.size());
+    }
+    pos_queue_.clear();
+    cur_pos_.clear();
+
+    auto conv = std::make_unique<ConvStore>();
+    {
+        auto & store = runtime_->store();
+        // Per-block residency lives inside the bundle (KvMemBlock::gpu_slot)
+        // while the slot pool is engine-side, and every conversation numbers
+        // its rows from 0, so the working set must be fully drained to host.
+        // tier is the residency truth, not gpu_slot: the slot is one field of a
+        // pair KvMemStore::set_block_tier writes together
+        // (kvmem/src/host/kvmem_store.cpp:249-276), so this filters on the half
+        // that names the tier. This is the same set set_selection stages out.
+        for (uint32_t id = 0; id < store.block_count(); ++id) {
+            const kvmem::KvMemBlock & b = store.blocks()[id];
+            if (b.tier == kvmem::KvTier::GPU && b.gpu_slot >= 0 && b.n_tokens > 0) {
+                conv->resident.push_back(id);
+            }
+        }
+        // An empty selection puts every GPU block in stage_out, and
+        // apply_plan_to_kv is the drain half of the sequence relayout already
+        // uses: harvest_gpu_v + mtp_->on_stage_out per block, commit,
+        // spill_outgoing, seq_rm_logical per block, admit_incoming.
+        const kvmem::KvMemPlan plan = runtime_->prepare_selection({});
+        trace_plan("conv_detach", plan);
+        apply_plan_to_kv(plan);
+        // Belt and braces: a detached store carrying a stale gpu_slot would
+        // make gpu_kv_already_resident() and attention_view() read cells that
+        // belong to another conversation. KvMemStore::set_block_tier already
+        // clears the slot on the way off GPU, so this loop finds nothing
+        // unless a block never reached a lower tier. Demote rather than only
+        // clearing the slot: tier GPU with gpu_slot -1 is read three
+        // incompatible ways downstream (stage_in wants a fresh slot,
+        // resident_tokens counts it as absent, set_selection will not stage it
+        // out again), so clearing alone would trade one inconsistent state for
+        // another on a block conv->resident will ask to be restaged.
+        for (uint32_t id = 0; id < store.block_count(); ++id) {
+            const kvmem::KvMemBlock & b = store.blocks()[id];
+            if (b.gpu_slot < 0) {
+                continue;
+            }
+            LLAMA_LOG_WARN("%s: KVMem block %u still held GPU slot %d at tier %d after a full drain\n",
+                    __func__, id, (int) b.gpu_slot, (int) b.tier);
+            store.set_block_tier(id, kvmem::KvTier::CPU, b.cpu_slot, b.nvme_slot);
+        }
+    }
+    // Issued on the borrowed attention cache, not through the hybrid override,
+    // so the recurrent half is deliberately left alone: the server owns that as
+    // a byte snapshot. This also drops an untrimmed speculative tail, which
+    // attention_view() counts as live attention.
+    if (kv_) {
+        (void) kv_->seq_rm(0, -1, -1);
+    }
+    if (mtp_) {
+        mtp_->drop_gpu();
+    }
+    reset_slots();
+    // Server-held attention views and selections must not validate across a
+    // swap, so the epoch stays engine-side and only ever increases.
+    ++attention_epoch_;
+    // Post-detach invariant: nothing of this conversation is left on the GPU,
+    // and the slot pool is whole again for the incoming one.
+    kvmem_diag("KVMEM_STORE_DETACH rows=%u resident=%zu cells_used=%u free_slots=%zu/%u\n",
+            runtime_ ? runtime_->store().total_tokens() : 0, conv->resident.size(),
+            (unsigned) (kv_ ? kv_->get_cells(0).get_used() : 0), free_slots_.size(), n_slots_);
+
+    // The drain above wrote the packed K/V of every resident block through
+    // harvest_gpu_v_commit(), which does not wait for the store's own writes.
+    if (raw_) {
+        raw_->wait_writes();
+    }
+    if (mtp_) {
+        mtp_->harvest_flush();
+    }
+
+    // Nothing from here to the return may throw. Past these two moves this
+    // object owns no store at all and swap_conv's drain catch cannot put them
+    // back: the move-assignments are noexcept, swap_raw() only waits on the
+    // follower's io thread and fills a vector it sized at construction, and
+    // reset_turn_policy() assigns scalars.
+    conv->runtime = std::move(runtime_);
+    conv->raw = std::move(raw_);
+    // One statement after the trunk's own mirror, the way truncate_cached()
+    // drives mtp_->truncate_cached(): the follower's packed draft K/V is keyed
+    // by the trunk's block ids and means nothing beside another store.
+    if (mtp_) {
+        conv->mtp_raw = mtp_->swap_raw(nullptr);
+    }
+    conv->row_positions = std::move(row_positions_);
+    conv->q_sum = std::move(q_sum_);
+    conv->q_count = std::move(q_count_);
+    row_positions_.clear();
+    q_sum_.clear();
+    q_count_.clear();
+    reset_turn_policy();
+    return conv;
+}
+
+bool llama_memory_kvmem::attach_conv(std::unique_ptr<ConvStore> conv) {
+    // The mirror image of detach_conv(). Every member this object owns per
+    // conversation is installed first, in container move-assignments that
+    // cannot throw, so this object owns the incoming conversation before
+    // anything that can throw runs: that is what makes swap_conv's catch able
+    // to reset it to empty instead of losing it. The size repair that follows
+    // the moves does allocate and can throw; reset_query_acc() resizes as well
+    // as zeroes, so the reset_policy() in that catch leaves an accumulator
+    // score_retrieval() and get_query() can index over 0..n_layer_-1, which
+    // they do with no size guard.
+    //
+    // The follower's mirror follows, because acquiring it can throw. It is
+    // keyed by this store's block ids, so a bundle made before the follower
+    // existed has none and gets a fresh one to rebuild at the next stage-out.
+    runtime_ = std::move(conv->runtime);
+    raw_ = std::move(conv->raw);
+    row_positions_ = std::move(conv->row_positions);
+    q_sum_ = std::move(conv->q_sum);
+    q_count_ = std::move(conv->q_count);
+    if (q_sum_.size() != n_layer_ || q_count_.size() != n_layer_) {
+        q_sum_.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
+        q_count_.assign(n_layer_, 0);
+    }
+    if (mtp_) {
+        std::unique_ptr<kvmem::RawKvStore> mirror = std::move(conv->mtp_raw);
+        if (!mirror) {
+            // The follower mirror is an accept-rate input and never a
+            // correctness one, so a failed allocation must not fail the
+            // attach. It does cost this conversation its draft mirror for the
+            // whole of this residency: with the follower's mirror null,
+            // harvest_k() and harvest_v() return at their first guard, so no
+            // stage-out mirrors anything. The allocation is retried at the
+            // next attach of this bundle, because the detach parks a null
+            // mirror (see the class comment in llama-memory-kvmem-mtp.h).
+            try {
+                mirror = mtp_->make_raw();
+            } catch (const std::exception & e) {
+                LLAMA_LOG_WARN("%s: KVMem MTP mirror allocation failed (%s); the follower keeps "
+                        "no packed draft K/V for this conversation\n", __func__, e.what());
+            }
+        }
+        mtp_->swap_raw(std::move(mirror));
+    }
+    ++attention_epoch_;
+    reset_slots();
+    // Not reset_policy(): its destructive half would clear the store just
+    // attached. The server calls llama_kvmem_begin_cached_turn() and
+    // llama_kvmem_set_request_span() after the attach anyway.
+    reset_turn_policy();
+    // runtime_ and raw_ are dereferenced unguarded from here on, and so is
+    // runtime_ in detach_conv(): make_conv() allocates both or throws, and
+    // every other bundle came from a detach that moved two non-null members
+    // out of this object. There is deliberately no null check reporting a
+    // miss: false means "attached, holding no rows the caller may decode
+    // against", and llama_kvmem_store_switch acts on it by naming this store
+    // as the attached one.
+    //
+    // An empty store always arrives beside an empty follower mirror: every
+    // path that empties one (reset_policy here, the refusal in swap_conv)
+    // empties the other. Report false, which is what the return value means
+    // everywhere else: the attached store holds no rows the caller may decode
+    // against. A freshly created store lands here beside an empty payload, so
+    // the server's !restaged branch is a no-op for it; a store the refusal
+    // path wiped lands here beside a payload that still claims rows, and that
+    // is exactly the mismatch the branch exists to catch.
+    if (runtime_->store().total_tokens() == 0) {
+        return false;
+    }
+
+    // write_block_to_gpu() silently skips a layer with no packed bytes, which
+    // would leave live cells holding another conversation's K. This is the same
+    // predicate harvest_full_blocks_async() uses; it must not be dropped.
+    const char * miss = nullptr;
+    {
+        const kvmem::KvMemStore & store = runtime_->store();
+        for (uint32_t id : conv->resident) {
+            if (id >= store.block_count()) {
+                miss = "block_gone";
+                break;
+            }
+            const kvmem::KvMemBlock & b = store.blocks()[id];
+            if (b.n_tokens == 0) {
+                continue;
+            }
+            for (uint32_t il = 0; il < n_layer_ && !miss; ++il) {
+                if (!kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
+                    continue;
+                }
+                if (!raw_->has_k_gpu(id, il, b.n_tokens)) {
+                    miss = "packed_k_missing";
+                } else if (!v_trans_ && !raw_->has_v_gpu(id, il, b.n_tokens)) {
+                    miss = "packed_v_missing";
+                }
+            }
+            if (miss) {
+                break;
+            }
+        }
+    }
+    if (miss) {
+        kvmem_diag("KVMEM_STORE_ATTACH_MISS reason=%s rows=%u resident=%zu\n",
+                miss, runtime_->store().total_tokens(), conv->resident.size());
+        reset_policy();
+        // reset_policy() clears the trunk's mirror only. Clear the follower's
+        // in lockstep so an empty store never sits beside a mirror still
+        // holding draft K/V for block ids the next prefill reuses.
+        if (mtp_) {
+            mtp_->clear(true);
+        }
+        return false;
+    }
+
+    // Nothing sits at tier GPU, so every requested block lands in stage_in and
+    // admit_incoming allocates one slot each through the backend. Slots come
+    // out ascending because alloc_slot pops the back of a list reset_slots
+    // filled n_slots_-1..0, which is the layout attention_view() calls
+    // canonical. Positions need no fixup: the pool keeps original positions and
+    // the packed K in raw_ was harvested already RoPE'd at that position.
+    const kvmem::KvMemPlan plan = runtime_->prepare_selection(conv->resident);
+    trace_plan("conv_attach", plan);
+    apply_plan_to_kv(plan);
+    auto & store = runtime_->store();
+    uint32_t n_raw = 0;
+    uint32_t n_skip = 0;
+    for (uint32_t id : plan.stage_in) {
+        if (id >= store.block_count() || store.blocks()[id].gpu_slot < 0) {
+            continue;
+        }
+        if (gpu_kv_already_resident(id)) {
+            n_skip++;
+            continue;
+        }
+        write_block_to_gpu(id);
+        n_raw++;
+    }
+    kvmem_stagein_flush_sync(retr_.enabled ? &retr_.copy_us : nullptr,
+                             retr_.enabled ? &retr_.rope_us : nullptr,
+                             retr_.enabled ? &retr_.hadamard_us : nullptr,
+                             retr_.enabled ? &retr_.set_us : nullptr);
+    if (mtp_) {
+        // A follower coverage miss leaves its cells empty rather than
+        // labelling them with this block's positions, because the bytes in
+        // them are the previous conversation's draft K. That holds for the
+        // rest of the request and not only for this call: the strictness is a
+        // per-slot mark swap_raw() set above, which follow_retrieval() reads
+        // on the retrieval path too, and which only a full packed write
+        // clears.
+        mtp_->follow_retrieval();
+    }
+    if (trace_) {
+        kvmem_diag("KVMEM_STORE_ATTACH rows=%u blocks=%zu raw=%u skip=%u free_slots=%zu\n",
+                store.total_tokens(), plan.stage_in.size(), n_raw, n_skip, free_slots_.size());
+    }
+    return true;
+}
+
+// Best-effort return to "attached, holding nothing". Both of swap_conv's
+// repair paths call this and neither may throw out of it: the drain path
+// rethrows the drain's own exception afterwards, and the attach path runs
+// after the two bundles have changed hands, where an escape would make
+// llama_kvmem_store_switch's catch skip a handover this object has already
+// made -- parking each conversation's payload beside the other's KV, which is
+// silent wrong-content service rather than a cache miss. So every step runs
+// under its own catch and the whole function is noexcept.
+void llama_memory_kvmem::conv_reset_to_empty(const char * what) noexcept {
+    try {
+        set_replay(false);
+        if (runtime_) {
+            // A prepared-but-unapplied plan would strand its queued slot frees
+            // and refuse the next swap with plan_pending. reset_policy() below
+            // rebuilds the free-slot list those frees would have fed.
+            runtime_->discard_pending();
+        }
+        if (kv_) {
+            // reset_policy() clears the host mirror and the block table but
+            // not the attention cells, so empty them the way detach_conv()
+            // does: apply_plan_to_kv() may already have admitted cells for a
+            // store that is about to be emptied.
+            (void) kv_->seq_rm(0, -1, -1);
+        }
+        // Set before reset_policy(), which clears it again on its way out. A
+        // store whose cells are gone while its block table still reads full is
+        // the one state store_n_tokens() cannot expose, so if the reset below
+        // does not complete, this mark is what stops the half-repaired store
+        // from being carried into another conversation: conv_can_drain()
+        // refuses it and the next swap clears it instead.
+        host_mirror_stale_ = true;
+        reset_slots();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: KVMem %s repair could not quiesce the active store (%s)\n",
+                __func__, what, e.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: KVMem %s repair could not quiesce the active store\n",
+                __func__, what);
+    }
+    // reset_policy() -> runtime_->truncate_to(0) -> wait_prefetch() rethrows a
+    // stored NVMe prefetch error exactly once: wait_prefetch() clears the
+    // futures before it rethrows, so the second attempt gets past it and does
+    // empty the block table. Without the retry the store would keep reading
+    // full with a working set that no longer describes it.
+    bool emptied = false;
+    for (int attempt = 1; attempt <= 2 && !emptied; ++attempt) {
+        try {
+            reset_policy();
+            emptied = true;
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: KVMem %s repair could not empty the active store "
+                    "(%s, attempt %d)\n", __func__, what, e.what(), attempt);
+        } catch (...) {
+            LLAMA_LOG_ERROR("%s: KVMem %s repair could not empty the active store "
+                    "(attempt %d)\n", __func__, what, attempt);
+        }
+    }
+    // The follower mirror is keyed by the trunk's block ids, so an emptied
+    // store must never sit beside a mirror still holding draft K/V for ids the
+    // next prefill reuses.
+    try {
+        if (mtp_) {
+            mtp_->clear(true);
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: KVMem %s repair could not clear the follower mirror (%s)\n",
+                __func__, what, e.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: KVMem %s repair could not clear the follower mirror\n",
+                __func__, what);
+    }
+    if (!emptied) {
+        LLAMA_LOG_ERROR("%s: KVMem %s repair left the active store unreset; it is marked "
+                "host_mirror_stale, so the next switch clears it rather than carrying it\n",
+                __func__, what);
+    }
+}
+
+bool llama_memory_kvmem::swap_conv(std::unique_ptr<ConvStore> & conv) {
+    if (!conv) {
+        return false;
+    }
+    std::string reason;
+    if (!conv_can_drain(reason)) {
+        // The outgoing conversation cannot be drained safely. Discard it rather
+        // than leave the GPU holding cells two stores both claim; that is the
+        // same destruction a single-store server does today when a different
+        // conversation arrives. The return value describes the incoming store
+        // only, so the wipe is reported the one way a caller can act on: the
+        // parked handle's llama_kvmem_store_rows() drops to zero, which the
+        // server cross-checks after every switch.
+        LLAMA_LOG_WARN("%s: KVMem store swap cannot drain the active store (%s); clearing it\n",
+                __func__, reason.c_str());
+        set_replay(false);
+        clear(true);
+        // The follower mirror is keyed by the trunk's block ids, and the server
+        // is switching rather than clearing, so it will not clear the draft
+        // context for us the way memory_clear_all() does. Leaving it would let
+        // follow_retrieval() write this conversation's draft K into a block id
+        // the next one re-prefills.
+        if (mtp_) {
+            mtp_->clear(true);
+        }
+    }
+    // All-or-nothing in the handles. detach_conv() moves both bundle members
+    // out in a run of noexcept move-assignments with nothing allocating past
+    // them, so a throw out of detach_conv() moves neither bundle: the caller's
+    // handle still holds the incoming conversation and this object still owns
+    // the outgoing one. The outgoing store's contents are a separate question.
+    // The refusal above may already have cleared them, and the drain can throw
+    // with a plan half applied (spill_outgoing() rethrows a stored prefetch
+    // exception and an NVMe write can fail), which leaves a working set that no
+    // longer describes the store while total_tokens() still reads full -- the
+    // one thing the server's post-switch cross-check cannot see. So empty this
+    // store on that path and let it be read as the cache miss it now is.
+    //
+    // Past the two moves below the outgoing conversation is the caller's, and
+    // nothing from there on throws: the attach's repair is noexcept and its
+    // failure is reported as false. The outgoing bundle used to stay in a local
+    // until the last statement, so a throw inside the attach destroyed a whole
+    // conversation's host KV and left the caller's handle moved-from and null
+    // while the pool still named it.
+    std::unique_ptr<ConvStore> outgoing;
+    try {
+        outgoing = detach_conv();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: KVMem store drain failed (%s); the active store is reset to empty\n",
+                __func__, e.what());
+        conv_reset_to_empty("drain");
+        throw;
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: KVMem store drain failed; the active store is reset to empty\n",
+                __func__);
+        conv_reset_to_empty("drain");
+        throw;
+    }
+    std::unique_ptr<ConvStore> incoming = std::move(conv);
+    conv = std::move(outgoing);
+    try {
+        return attach_conv(std::move(incoming));
+    } catch (const std::exception & e) {
+        // occupy_in throws on missing cache row position metadata, and the
+        // staging paths throw on a CUDA failure. attach_conv() takes the
+        // incoming store's members before any of that, so this object owns it:
+        // reset it to empty and keep it active, which is the state the
+        // coverage-miss path above leaves and which the server reads as an
+        // ordinary cache miss from the false return. The reset is noexcept,
+        // and catch (...) is here for the same reason it is: both bundles have
+        // already changed hands, so an escape from this handler would make
+        // llama_kvmem_store_switch's catch skip a handover that already
+        // happened and leave each conversation's payload beside the other's KV.
+        LLAMA_LOG_ERROR("%s: KVMem store attach failed (%s); the incoming store is reset to empty\n",
+                __func__, e.what());
+        conv_reset_to_empty("attach");
+        return false;
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: KVMem store attach failed; the incoming store is reset to empty\n",
+                __func__);
+        conv_reset_to_empty("attach");
+        return false;
+    }
 }
 
 llama_pos llama_memory_kvmem::recr_pos_max() const {
@@ -1042,20 +2000,26 @@ bool llama_memory_kvmem::layout_gpu_slots_by_orig_pos() {
         moves.push_back({static_cast<uint32_t>(items[i].slot), static_cast<uint32_t>(i), items[i].n});
     }
 
-    // Free the harvest staging before asking for layout scratch.
-    d2h_trim_idle();
-    size_t scratch_blocks = kvmem_layout_scratch_blocks(moves.data(), moves.size(), scratch_stride);
-    bool d2d_ok = n_res > 0;
-    uint8_t * scratch = scratch_blocks ? kvmem_try_alloc(scratch_blocks * scratch_stride) : nullptr;
-    if (scratch_blocks && !scratch && kvmem_layout_bounded_enabled()) {
-        // One spare block is enough for the moves that cannot be ordered.
-        scratch_blocks = 1;
-        scratch = kvmem_try_alloc(scratch_stride);
-    }
-    if (scratch_blocks && !scratch) {
-        scratch_blocks = 0;
-        d2d_ok = false;
-        LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
+    // The single scratch allocation and batched D2D kernel can only touch tensors on its own GPU,
+    // so a layer split takes the backend's per-tensor host path instead.
+    bool d2d_ok = n_res > 0 && !multi_gpu_;
+    size_t scratch_blocks = 0;
+    uint8_t * scratch = nullptr;
+    if (d2d_ok) {
+        // Free the harvest staging before asking for layout scratch.
+        d2h_trim_idle();
+        scratch_blocks = kvmem_layout_scratch_blocks(moves.data(), moves.size(), scratch_stride);
+        scratch = scratch_blocks ? kvmem_try_alloc(scratch_blocks * scratch_stride) : nullptr;
+        if (scratch_blocks && !scratch && kvmem_layout_bounded_enabled()) {
+            // One spare block is enough for the moves that cannot be ordered.
+            scratch_blocks = 1;
+            scratch = kvmem_try_alloc(scratch_stride);
+        }
+        if (scratch_blocks && !scratch) {
+            scratch_blocks = 0;
+            d2d_ok = false;
+            LLAMA_LOG_WARN("%s: layout scratch cudaMalloc failed, host fallback\n", __func__);
+        }
     }
     if (d2d_ok) {
         if (trace_) {
@@ -1497,6 +2461,16 @@ bool llama_memory_kvmem::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1)
     if (!replay_ &&
         seq_id <= 0 && p0 <= 0 &&
         (p1 < 0 || p1 >= static_cast<llama_pos>(runtime_->store().total_tokens()))) {
+        // Known divergence, deliberately not repaired here so the default
+        // path stays byte-identical: the block table is zeroed while the host
+        // mirror keeps its blocks, and truncate_cached's guard
+        // (n_past >= total_tokens) can no longer reach them. The re-prefilled
+        // block 0 then keeps the previous content's packed K, because both
+        // harvest_gpu_v and harvest_full_blocks_async skip a layer whose
+        // packed K is already present. Record it so a store swap declines to
+        // carry this store rather than restaging those bytes into another
+        // conversation's cells; reset_policy() clears both and the flag.
+        host_mirror_stale_ = true;
         runtime_->truncate_to(0);
         reset_slots();
         retrieval_pinned_ = false;
@@ -1661,6 +2635,145 @@ void llama_memory_kvmem::d2h_free() {
         d2h_->stream = nullptr;
     }
     d2h_->ok = false;
+}
+
+void llama_memory_kvmem::multi_d2h_free() {
+    if (!multi_d2h_) return;
+    int original = -1;
+    (void) cudaGetDevice(&original);
+    for (auto & dev : multi_d2h_->devices) {
+        if (dev.id >= 0) (void) cudaSetDevice(dev.id);
+        if (dev.stream) {
+            (void) cudaStreamSynchronize(dev.stream);
+            (void) cudaStreamDestroy(dev.stream);
+            dev.stream = nullptr;
+        }
+        if (dev.pin) {
+            (void) cudaFreeHost(dev.pin);
+            dev.pin = nullptr;
+        }
+    }
+    if (original >= 0) (void) cudaSetDevice(original);
+    multi_d2h_.reset();
+}
+
+bool llama_memory_kvmem::multi_d2h_submit() {
+    if (pending_capture_.empty() || pos_queue_.empty()) return false;
+    if (!multi_d2h_) multi_d2h_ = std::make_unique<MultiD2hPipe>();
+    auto & pipe = *multi_d2h_;
+    pipe.items.clear();
+    for (auto & dev : pipe.devices) dev.used = 0;
+
+    int original = -1;
+    if (cudaGetDevice(&original) != cudaSuccess) return false;
+    struct DeviceRestore {
+        int id;
+        ~DeviceRestore() { (void) cudaSetDevice(id); }
+    } restore{original};
+
+    // A layer split has ordinary CUDA tensors owned by one physical GPU.
+    for (const CaptureNode & n : pending_capture_) {
+        if (!n.t || n.which == 'v') continue;
+        const uint8_t * src = kvmem_cuda_tensor_ptr(n.t);
+        if (!src) return false;
+        cudaPointerAttributes attr{};
+        if (cudaPointerGetAttributes(&attr, src) != cudaSuccess || attr.type != cudaMemoryTypeDevice) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        size_t index = 0;
+        for (; index < pipe.devices.size(); ++index) {
+            if (pipe.devices[index].id == attr.device) break;
+        }
+        if (index == pipe.devices.size()) {
+            pipe.devices.emplace_back();
+            pipe.devices.back().id = attr.device;
+        }
+        auto & dev = pipe.devices[index];
+        if (!dev.stream && (!kvmem_cuda_ok(cudaSetDevice(dev.id), "multi set device") ||
+                !kvmem_cuda_ok(cudaStreamCreateWithFlags(&dev.stream, cudaStreamNonBlocking), "multi stream"))) {
+            return false;
+        }
+        MultiD2hPipe::Item item;
+        item.device = index;
+        item.src = src;
+        item.capture.il = n.il;
+        item.capture.which = n.which;
+        item.capture.offset = dev.used;
+        item.capture.nbytes = ggml_nbytes(n.t);
+        item.capture.d = n.t->ne[0];
+        item.capture.h = n.t->ne[1];
+        item.capture.n = n.t->ne[2];
+        item.capture.nb0 = n.t->nb[0];
+        item.capture.nb1 = n.t->nb[1];
+        item.capture.nb2 = n.t->nb[2];
+        item.capture.type = n.t->type;
+        dev.used += item.capture.nbytes;
+        pipe.items.push_back(item);
+    }
+    for (auto & dev : pipe.devices) {
+        if (dev.used <= dev.cap) continue;
+        if (dev.pin) {
+            (void) cudaFreeHost(dev.pin);
+            dev.pin = nullptr;
+            dev.cap = 0;
+        }
+        if (!kvmem_cuda_ok(cudaSetDevice(dev.id), "multi set device") ||
+            !kvmem_cuda_ok(cudaMallocHost(reinterpret_cast<void **>(&dev.pin), dev.used), "multi pinned host")) {
+            (void) cudaGetLastError();
+            return false;
+        }
+        dev.cap = dev.used;
+    }
+
+    const int64_t t_read = ggml_time_us();
+    bool submitted = true;
+    for (size_t index = 0; index < pipe.devices.size(); ++index) {
+        auto & dev = pipe.devices[index];
+        if (!dev.used) continue;
+        if (!kvmem_cuda_ok(cudaSetDevice(dev.id), "multi set device")) {
+            submitted = false;
+            break;
+        }
+        for (const auto & item : pipe.items) {
+            if (item.device != index) continue;
+            if (!kvmem_cuda_ok(kvmem_copy_async(dev.pin + item.capture.offset, item.src,
+                    item.capture.nbytes, cudaMemcpyDeviceToHost, dev.stream), "multi D2H")) {
+                submitted = false;
+                break;
+            }
+        }
+        if (!submitted) break;
+    }
+    for (auto & dev : pipe.devices) {
+        if (!dev.stream || !dev.used) continue;
+        (void) cudaSetDevice(dev.id);
+        if (!kvmem_cuda_ok(cudaStreamSynchronize(dev.stream), "multi D2H wait")) submitted = false;
+    }
+    if (!submitted) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    const int64_t read_us = ggml_time_us() - t_read;
+    cur_pos_ = std::move(pos_queue_.front());
+    pos_queue_.erase(pos_queue_.begin());
+    const int64_t t_host = ggml_time_us();
+    for (const auto & item : pipe.items) {
+        const auto & c = item.capture;
+        // the batch path copies every row, so the Q window starts at 0
+        harvest_from_host(c.il, c.which, pipe.devices[item.device].pin + c.offset,
+                          c.type, c.d, c.h, c.n, c.row0, c.nb0, c.nb1, c.nb2);
+    }
+    const int64_t host_us = ggml_time_us() - t_host;
+    if (perf_.enabled) {
+        perf_.multi_read_us += read_us;
+        perf_.multi_host_us += host_us;
+        size_t bytes = 0;
+        for (const auto & dev : pipe.devices) bytes += dev.used;
+        fprintf(stderr, "KVMEM_MULTI_D2H mode=batch devices=%zu copies=%zu bytes=%zu read_ms=%.3f host_ms=%.3f\n",
+                pipe.devices.size(), pipe.items.size(), bytes, read_us / 1000.0, host_us / 1000.0);
+    }
+    return true;
 }
 
 bool llama_memory_kvmem::harvest_worker_on() const {
@@ -2215,6 +3328,38 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
         harvest_full_blocks_async();
         return;
     }
+    if (multi_gpu_) {
+        // Finish the graph before capture tensors can be recycled by the next ubatch.
+        // The CUDA layer path uses one D2H stream per physical GPU.
+        const int64_t t_sync = ggml_time_us();
+        if (sched) ggml_backend_sched_synchronize(sched);
+        const int64_t sync_us = ggml_time_us() - t_sync;
+        const int64_t read_before = perf_.multi_read_us;
+        const int64_t host_before = perf_.multi_host_us;
+        const char * batch_env = getenv("KVMEM_MULTI_D2H_BATCH");
+        auto * reg = !kvmem_tensor_multi_gpu(model_) && !model_.devices.empty() ?
+                ggml_backend_dev_backend_reg(model_.devices[0].dev) : nullptr;
+        const bool is_cuda = reg && std::strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+        const bool batch_on = is_cuda && (!batch_env || batch_env[0] != '0');
+        const bool batched = batch_on && multi_d2h_submit();
+        if (!batched) {
+            cur_pos_ = std::move(pos_queue_.front());
+            pos_queue_.erase(pos_queue_.begin());
+            for (const CaptureNode & n : pending_capture_) {
+                harvest_capture(n.t, n.il, n.which);
+            }
+        }
+        const int64_t t_block = ggml_time_us();
+        harvest_full_blocks_async();
+        const int64_t block_us = ggml_time_us() - t_block;
+        if (perf_.enabled) {
+            fprintf(stderr, "KVMEM_MULTI_HARVEST mode=%s n=%zu sync_ms=%.3f read_ms=%.3f host_ms=%.3f block_ms=%.3f\n",
+                    batched ? "batch" : "legacy", cur_pos_.size(), sync_us / 1000.0,
+                    (perf_.multi_read_us - read_before) / 1000.0,
+                    (perf_.multi_host_us - host_before) / 1000.0, block_us / 1000.0);
+        }
+        return;
+    }
     ggml_backend_t be = nullptr;
     if (sched) {
         for (const CaptureNode & n : pending_capture_) {
@@ -2278,6 +3423,16 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
 }
 
 void llama_memory_kvmem::reset_query_acc() {
+    // Repair the size, not only the contents. attach_conv() installs the
+    // incoming conversation's accumulators and then resizes them, and that
+    // resize can throw between the two; reset_policy() calls this to make the
+    // object usable again, and score_retrieval() and get_query() index
+    // q_count_ over 0..n_layer_-1 with no size guard.
+    if (q_sum_.size() != n_layer_ || q_count_.size() != n_layer_) {
+        q_sum_.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
+        q_count_.assign(n_layer_, 0);
+        return;
+    }
     for (auto & s : q_sum_) {
         std::fill(s.begin(), s.end(), 0.0f);
     }
@@ -2342,14 +3497,16 @@ void llama_memory_kvmem::bytes_to_f16_token_major(const uint8_t * data, ggml_typ
     }
 }
 
-void llama_memory_kvmem::tensor_to_f32_token_major(const ggml_tensor * t, std::vector<float> & out) {
+void llama_memory_kvmem::tensor_to_f32_token_major(const ggml_tensor * t, std::vector<float> & out, int64_t * read_us) {
     std::vector<uint8_t> tmp;
     const uint8_t * data = nullptr;
     if (t->buffer && ggml_backend_buffer_is_host(t->buffer)) {
         data = static_cast<const uint8_t *>(t->data);
     } else {
         tmp.resize(ggml_nbytes(t));
+        const int64_t t_read = read_us ? ggml_time_us() : 0;
         kvmem_tensor_get(t, tmp.data(), 0, tmp.size());
+        if (read_us) *read_us += ggml_time_us() - t_read;
         data = tmp.data();
     }
     bytes_to_f32_token_major(data, t->type, t->ne[0], t->ne[1], t->ne[2],
@@ -2401,6 +3558,13 @@ void llama_memory_kvmem::harvest_from_host(int il, char which, const uint8_t * h
     if (!host || il < 0 || static_cast<uint32_t>(il) >= n_layer_ || cur_pos_.empty()) {
         return;
     }
+    // The worker calls this through `this`, and a store swap moves raw_ and
+    // q_sum_ out and back in. detach_conv() drains the pipe first, so the
+    // window is not reachable today; guard it anyway, because the alternative
+    // is a null dereference and an out-of-range write on an empty vector.
+    if (!raw_ || q_sum_.size() != n_layer_ || q_count_.size() != n_layer_) {
+        return;
+    }
     const uint32_t n = static_cast<uint32_t>(cur_pos_.size());
     const uint32_t pos0 = static_cast<uint32_t>(cur_pos_[0]);
     if (which == 'k') {
@@ -2447,7 +3611,11 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
         return;
     }
     std::vector<float> flat;
-    tensor_to_f32_token_major(t, flat);
+    const bool timed = perf_.enabled && multi_gpu_;
+    const int64_t t_host = timed ? ggml_time_us() : 0;
+    int64_t read_us = 0;
+    tensor_to_f32_token_major(t, flat, timed ? &read_us : nullptr);
+    if (timed) perf_.multi_read_us += read_us;
     const uint32_t n = static_cast<uint32_t>(cur_pos_.size());
     if (n == 0) {
         return;
@@ -2475,6 +3643,7 @@ void llama_memory_kvmem::harvest_capture(ggml_tensor * t, int il, char which) {
             accumulate_query_row(static_cast<uint32_t>(il), flat.data() + i * qdim, qdim, cur_pos_[i]);
         }
     }
+    if (timed) perf_.multi_host_us += ggml_time_us() - t_host - read_us;
 }
 
 void llama_memory_kvmem::harvest_write_batch() {
@@ -2596,12 +3765,21 @@ void llama_memory_kvmem::harvest_gpu_v(uint32_t block_id) {
     const size_t vrow = ggml_row_size(type_v_, n_embd_v_);
     const uint32_t nt = blk.n_tokens;
     const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
-    kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
-                            std::max(krow, vrow) * (size_t) block_tokens_);
+    if (!multi_gpu_) {
+        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+                                std::max(krow, vrow) * (size_t) block_tokens_);
+    }
     auto enqueue_or_get = [&](ggml_tensor * t, uint32_t il, uint32_t nget, bool is_k) {
         const size_t row = is_k ? krow : vrow;
         const size_t nbytes = static_cast<size_t>(nget) * row;
         const size_t toff = static_cast<size_t>(cell0) * row;
+        if (multi_gpu_) {
+            std::vector<uint8_t> packed(nbytes);
+            kvmem_tensor_get(t, packed.data(), toff, nbytes);
+            if (is_k) raw_->write_layer_k_gpu(blk.orig_pos_start, nget, il, packed.data());
+            else raw_->write_layer_v_gpu(blk.orig_pos_start, nget, il, packed.data());
+            return;
+        }
         uint8_t * base = kvmem_cuda_tensor_ptr(t);
         const uint8_t * gpu_src = (base && nbytes > 0) ? base + toff : nullptr;
         HarvestVJob job;
@@ -2725,7 +3903,7 @@ void llama_memory_kvmem::decode_mean_discard() {
 }
 
 void llama_memory_kvmem::decode_mean_zero_acc() {
-    if (kvmem_meank_ready(n_layer_, n_embd_k_)) {
+    if (!multi_gpu_ && kvmem_meank_ready(n_layer_, n_embd_k_)) {
         for (uint32_t il = 0; il < n_layer_; ++il) {
             kvmem_meank_zero(il);
         }
@@ -2851,7 +4029,7 @@ void llama_memory_kvmem::decode_mean_add_range(uint32_t tok0, uint32_t n_add) {
         decode_mean_pos0_ = static_cast<uint32_t>(pos0);
         decode_mean_n_ = 0;
     }
-    const bool gpu_ready = kvmem_meank_ready(n_layer_, n_embd_k_);
+    const bool gpu_ready = !multi_gpu_ && kvmem_meank_ready(n_layer_, n_embd_k_);
     bool any = false;
     for (const CaptureNode & n : decode_mean_pending_k_) {
         if (!n.t || static_cast<uint32_t>(n.il) >= n_layer_) {
@@ -2923,7 +4101,7 @@ void llama_memory_kvmem::decode_mean_flush() {
     if (decode_mean_n_ == 0 || !raw_ || decode_mean_block_ == ~0u) {
         return;
     }
-    kvmem_stagein_sync();
+    if (!multi_gpu_) kvmem_stagein_sync();
     std::vector<float> sum(n_embd_k_, 0.0f);
     uint32_t n_ok = 0;
     uint32_t n_gpu = 0;
@@ -2950,7 +4128,7 @@ void llama_memory_kvmem::decode_mean_flush() {
             continue;
         }
         raw_->write_layer_mean_sum(decode_mean_pos0_, decode_mean_n_, il, sum.data());
-        kvmem_meank_zero(il);
+        if (!multi_gpu_) kvmem_meank_zero(il);
         if (n_ok == 0 && n_embd_k_ > 0) {
             double acc = 0;
             for (uint32_t d = 0; d < n_embd_k_; ++d) {
@@ -2997,12 +4175,18 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
     std::vector<uint8_t> kpack(static_cast<size_t>(nt) * krow);
     std::vector<uint8_t> vpack(static_cast<size_t>(nt) * vrow);
     const uint32_t cell0 = static_cast<uint32_t>(blk.gpu_slot) * block_tokens_;
-    kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
-                            std::max(krow, vrow) * (size_t) block_tokens_);
+    if (!multi_gpu_) {
+        kvmem_stagein_gpu_ready((size_t) block_tokens_ * std::max(n_embd_k_, n_embd_v_),
+                                std::max(krow, vrow) * (size_t) block_tokens_);
+    }
     int64_t * sacc = retr_.enabled ? &retr_.set_us : nullptr;
     auto write_packed = [&](ggml_tensor * t, uint8_t * base, const uint8_t * host,
                             size_t row, size_t nbytes) {
         if (!t || !host || nbytes == 0 || cell0 >= kv_size_) {
+            return;
+        }
+        if (multi_gpu_) {
+            kvmem_tensor_set(t, host, static_cast<size_t>(cell0) * row, nbytes);
             return;
         }
         uint8_t * dst = base ? base + static_cast<size_t>(cell0) * row : nullptr;
@@ -3032,8 +4216,8 @@ void llama_memory_kvmem::write_block_to_gpu(uint32_t block_id) {
         }
         ggml_tensor * kt = kv_->get_k_storage(static_cast<int32_t>(il));
         ggml_tensor * vt = kv_->get_v_storage(static_cast<int32_t>(il));
-        uint8_t * kbase = kvmem_cuda_tensor_ptr(kt);
-        uint8_t * vbase = (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
+        uint8_t * kbase = multi_gpu_ ? nullptr : kvmem_cuda_tensor_ptr(kt);
+        uint8_t * vbase = multi_gpu_ ? nullptr : (vt && !v_trans_) ? kvmem_cuda_tensor_ptr(vt) : nullptr;
         if (have_k) {
             write_packed(kt, kbase, kpack.data(), krow, krow * (size_t) nt);
         }
@@ -3820,7 +5004,9 @@ void llama_memory_kvmem::dump_kv_compare(int32_t block_id, bool writeback_test) 
         return true;
     };
 
-    const uint32_t layers_show[] = {0, n_layer_ / 2, n_layer_ > 0 ? n_layer_ - 1 : 0};
+    const auto & attn_layers = kv_->get_layer_ids();
+    if (attn_layers.empty()) return;
+    const uint32_t layers_show[] = {attn_layers.front(), attn_layers[attn_layers.size() / 2], attn_layers.back()};
     for (uint32_t li = 0; li < 3; ++li) {
         const uint32_t il = layers_show[li];
         if (il >= n_layer_ || !kvmem_cache_has_layer(kv_, static_cast<int32_t>(il))) {
@@ -4221,4 +5407,232 @@ void llama_kvmem_get_tail_mean(uint32_t row, std::vector<float> & state) {
 
 void llama_kvmem_set_tail_mean(uint32_t row, const std::vector<float> & state) {
     if (auto * mem = kvmem_capture_active()) mem->raw().restore_mean_checkpoint(row, state);
+}
+
+bool llama_kvmem_store_swap_supported(void) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem) {
+        return false;
+    }
+    std::string reason;
+    return mem->conv_swap_supported(reason);
+}
+
+int32_t llama_kvmem_store_create(void) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem) {
+        return -1;
+    }
+    std::string reason;
+    if (!mem->conv_swap_supported(reason)) {
+        LLAMA_LOG_WARN("%s: KVMem host-store swap unavailable (%s)\n", __func__, reason.c_str());
+        return -1;
+    }
+    kvmem_conv_pool * pool = kvmem_conv_pool_bind(mem);
+    if (!pool) {
+        return -1;
+    }
+    // Nothing may cross the LLAMA_API boundary: a bundle is a runtime, two
+    // host mirrors and a pinned arena, so allocation failure is a -1 the
+    // server already handles and not an exception httplib would swallow.
+    std::unique_ptr<llama_memory_kvmem::ConvStore> store;
+    try {
+        store = mem->make_conv();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("%s: KVMem host store allocation failed (%s)\n", __func__, e.what());
+        return -1;
+    }
+    if (!store) {
+        return -1;
+    }
+    kvmem_conv_entry entry;
+    entry.id = pool->next_id++;
+    entry.store = std::move(store);
+    const int32_t id = entry.id;
+    pool->entries.push_back(std::move(entry));
+    kvmem_diag("KVMEM_STORE_CREATE id=%d n_stores=%zu\n", id, pool->entries.size());
+    return id;
+}
+
+bool llama_kvmem_store_switch(int32_t store_id) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem || g_conv_pool.owner != mem) {
+        return false;
+    }
+    if (store_id == g_conv_pool.active) {
+        return mem->store_n_tokens() > 0;
+    }
+    kvmem_conv_entry * in = kvmem_conv_find(store_id);
+    kvmem_conv_entry * out = kvmem_conv_find(g_conv_pool.active);
+    if (!in || !in->store || in->store->cold || (out && out->store) || (!out && g_conv_pool.active != -1)) {
+        LLAMA_LOG_ERROR("%s: KVMem store %d is not a detached host store\n", __func__, store_id);
+        return false;
+    }
+    const int64_t t0 = ggml_time_us();
+    const uint32_t out_rows = mem->store_n_tokens();
+    bool restaged = false;
+    try {
+        restaged = mem->swap_conv(in->store);
+    } catch (const std::exception & e) {
+        // swap_conv throws only before it hands either bundle over -- out of
+        // the drain, or out of the clear it runs when the active store cannot
+        // be drained safely -- so both handles and g_conv_pool.active still
+        // name what they named. Past the handover nothing throws: the attach's
+        // repair path is noexcept and reports its failure as false, so this
+        // catch can never run with the two bundles already exchanged, which is
+        // what makes skipping the two assignments below the right repair.
+        // What the handles name is not necessarily unchanged: swap_conv empties
+        // this store both when it cannot be drained safely and when the drain
+        // throws, so store_n_tokens() may now read zero, and that is the one
+        // signal the server acts on. Report the refusal rather than letting the
+        // exception reach httplib, which would swallow it and leave the server
+        // serving against a pool whose active entry no longer describes the
+        // store. catch (...) is here for that last reason: this is an
+        // LLAMA_API boundary, so nothing may cross it, not only what derives
+        // from std::exception.
+        LLAMA_LOG_ERROR("%s: KVMem store swap to %d failed (%s); store %d stays active\n",
+                __func__, store_id, e.what(), (int) g_conv_pool.active);
+        return false;
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: KVMem store swap to %d failed; store %d stays active\n",
+                __func__, store_id, (int) g_conv_pool.active);
+        return false;
+    }
+    // swap_conv leaves the outgoing conversation in the handle it was given.
+    const int32_t out_id = out ? out->id : -1;
+    if (out) out->store = std::move(in->store);
+    else kvmem_conv_release(in->store); // temporary empty execution store
+    g_conv_pool.active = store_id;
+    kvmem_diag("KVMEM_STORE_SWAP out=%d in=%d n_stores=%zu out_rows=%u in_rows=%u restaged=%d ms=%.2f\n",
+            out_id, store_id, g_conv_pool.entries.size(), out_rows, mem->store_n_tokens(),
+            (int) restaged, (ggml_time_us() - t0) / 1000.0);
+    return restaged;
+}
+
+int32_t llama_kvmem_store_current(void) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem) {
+        return -1;
+    }
+    return g_conv_pool.owner == mem ? g_conv_pool.active : 0;
+}
+
+bool llama_kvmem_store_destroy(int32_t store_id) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem || g_conv_pool.owner != mem || store_id == g_conv_pool.active) {
+        return false;
+    }
+    for (auto it = g_conv_pool.entries.begin(); it != g_conv_pool.entries.end(); ++it) {
+        if (it->id != store_id) {
+            continue;
+        }
+        kvmem_conv_release(it->store);
+        g_conv_pool.entries.erase(it);
+        kvmem_diag("KVMEM_STORE_DESTROY id=%d n_stores=%zu\n", store_id, g_conv_pool.entries.size());
+        return true;
+    }
+    return false;
+}
+
+uint32_t llama_kvmem_store_rows(int32_t store_id) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem) {
+        return 0;
+    }
+    if (g_conv_pool.owner != mem) {
+        return store_id == 0 ? mem->store_n_tokens() : 0;
+    }
+    if (store_id == g_conv_pool.active) {
+        return mem->store_n_tokens();
+    }
+    const kvmem_conv_entry * e = kvmem_conv_find(store_id);
+    return (e && e->store) ? mem->conv_n_tokens(*e->store) : 0;
+}
+
+uint64_t llama_kvmem_store_bytes(int32_t store_id) {
+    llama_memory_kvmem * mem = kvmem_capture_active();
+    if (!mem) {
+        return 0;
+    }
+    const bool pooled = g_conv_pool.owner == mem;
+    if (!pooled) {
+        return store_id == 0 ? mem->host_bytes() : 0;
+    }
+    if (store_id == g_conv_pool.active) {
+        return mem->host_bytes();
+    }
+    const kvmem_conv_entry * e = kvmem_conv_find(store_id);
+    return (e && e->store) ? mem->conv_host_bytes(*e->store) : 0;
+}
+
+bool llama_kvmem_store_park() {
+    auto * mem = kvmem_capture_active();
+    if (!mem || !kvmem_conv_pool_bind(mem)) return false;
+    if (g_conv_pool.active == -1) return true;
+    auto * out = kvmem_conv_find(g_conv_pool.active);
+    if (!out || out->store) return false;
+    try {
+        auto empty = mem->make_conv();
+        mem->swap_conv(empty);
+        out->store = std::move(empty);
+        g_conv_pool.active = -1;
+        return true;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("KVMEM session park failed: %s\n", e.what());
+        return false;
+    }
+}
+
+static llama_memory_kvmem::ConvStore & kvmem_detached(int32_t id) {
+    if (g_conv_pool.owner != kvmem_capture_active() || id == g_conv_pool.active)
+        throw std::runtime_error("session snapshot requires a detached store");
+    auto * e = kvmem_conv_find(id);
+    if (!e || !e->store) throw std::runtime_error("unknown detached session store");
+    return *e->store;
+}
+
+void llama_kvmem_store_freeze(int32_t id, std::vector<kvmem::SnapshotBuffer> & buffers) {
+    auto & s = kvmem_detached(id);
+    if (s.cold) throw std::runtime_error("session is already frozen");
+    s.raw->snapshot_buffers(buffers);
+    if (s.mtp_raw) s.mtp_raw->snapshot_buffers(buffers);
+    s.cold = true; // partial stores must never be attached to inference
+}
+
+void llama_kvmem_store_thaw(int32_t id) {
+    kvmem_detached(id).cold = false;
+}
+
+void llama_kvmem_store_snapshot_write(int32_t id, kvmem::SnapshotWriter & out) {
+    auto & s = kvmem_detached(id);
+    if (s.cold) throw std::runtime_error("session is already on disk");
+    out.scalar(id);
+    out.scalar(s.runtime->store().total_tokens());
+    s.raw->snapshot_write(out);
+    out.scalar(uint8_t(s.mtp_raw != nullptr));
+    if (s.mtp_raw) s.mtp_raw->snapshot_write(out);
+}
+
+void llama_kvmem_store_release_payload(int32_t id) {
+    auto & s = kvmem_detached(id);
+    auto raw = std::make_unique<kvmem::RawKvStore>(s.raw->config());
+    auto mtp = s.mtp_raw ? std::make_unique<kvmem::RawKvStore>(s.mtp_raw->config()) : nullptr;
+    s.raw = std::move(raw); s.mtp_raw = std::move(mtp); s.cold = true;
+}
+
+void llama_kvmem_store_snapshot_read(int32_t id, kvmem::SnapshotReader & in) {
+    auto & s = kvmem_detached(id);
+    if (!s.cold) throw std::runtime_error("session restore requires an empty host payload");
+    in.expect(id); in.expect(s.runtime->store().total_tokens());
+    auto raw = std::make_unique<kvmem::RawKvStore>(s.raw->config());
+    raw->snapshot_read(in, s.runtime->store().block_count());
+    in.expect(uint8_t(s.mtp_raw != nullptr));
+    auto mtp = s.mtp_raw ? std::make_unique<kvmem::RawKvStore>(s.mtp_raw->config()) : nullptr;
+    if (mtp) mtp->snapshot_read(in, s.runtime->store().block_count());
+    s.raw = std::move(raw); s.mtp_raw = std::move(mtp); s.cold = false;
+}
+
+uint64_t llama_kvmem_store_capacity(uint32_t tokens) {
+    auto * mem = kvmem_capture_active();
+    return mem ? mem->host_capacity(tokens) : 0;
 }

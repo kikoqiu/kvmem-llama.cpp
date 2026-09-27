@@ -1,5 +1,12 @@
 #include "kvmem/raw_kv_store.hpp"
+#include "kvmem/snapshot.hpp"
+#include "kvmem/snapshot_buffer.hpp"
+#if defined(_WIN32)
+// The POSIX implementation cannot be built on Windows; see the header.
+#include "kvmem/nvme_kv_tier_win.hpp"
+#else
 #include "kvmem/nvme_kv_tier.hpp"
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -10,6 +17,10 @@
 #include <utility>
 
 namespace {
+// steady_clock is the portable spelling of CLOCK_MONOTONIC: it never steps
+// backwards and ignores wall-clock adjustments. libstdc++ implements it as
+// clock_gettime(CLOCK_MONOTONIC) on Linux, so behaviour there is unchanged;
+// MSVC has neither clock_gettime nor CLOCK_MONOTONIC.
 uint64_t monotonic_ns() {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -1174,6 +1185,105 @@ void RawKvStore::clear() {
     if (nvme_) {
         nvme_->clear();
     }
+}
+
+size_t RawKvStore::allocated_bytes() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    size_t bytes = sizeof(*this) + blocks_.capacity() * sizeof(BlockRaw);
+    for (const auto & b : blocks_) {
+        bytes += b.layers.capacity() * sizeof(LayerBlk);
+        for (const auto & l : b.layers) {
+            bytes += l.k.capacity() + l.v.capacity()*2 + l.k_gpu.capacity() + l.v_gpu.capacity();
+            bytes += l.k_sum.capacity()*sizeof(float);
+        }
+    }
+    return bytes + io_.capacity()*2 + io8_.capacity();
+}
+
+uint64_t RawKvStore::capacity_bytes(uint32_t tokens, uint32_t populated_layers) const {
+    const uint64_t blocks = (uint64_t(tokens) + cfg_.block_tokens - 1) / cfg_.block_tokens + 1;
+    return sizeof(*this) + blocks * (2*sizeof(BlockRaw) + cfg_.n_layer*sizeof(LayerBlk) +
+        std::min(populated_layers, cfg_.n_layer) * (cfg_.n_embd_k*sizeof(float) + uint64_t(cfg_.block_tokens) *
+         (cfg_.k_gpu_row_bytes + cfg_.v_gpu_row_bytes)));
+}
+
+void RawKvStore::snapshot_buffers(std::vector<SnapshotBuffer> & buffers) {
+    wait_writes();
+    std::lock_guard<std::mutex> lk(mu_);
+    if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
+    for (auto & b : blocks_) for (auto & l : b.layers) {
+        // All lengths, token counts, formats and runtime identity stay in RAM.
+        // Empty allocations can be reclaimed too, without serializing capacity.
+        if (l.k.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k));
+        if (l.v.capacity()) buffers.push_back(SnapshotBuffer::bind(l.v));
+        if (l.k_gpu.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k_gpu));
+        if (l.v_gpu.capacity()) buffers.push_back(SnapshotBuffer::bind(l.v_gpu));
+        if (l.k_sum.capacity()) buffers.push_back(SnapshotBuffer::bind(l.k_sum));
+    }
+}
+
+void RawKvStore::snapshot_write(SnapshotWriter & out) {
+    wait_writes();
+    std::lock_guard<std::mutex> lk(mu_);
+    if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
+    out.scalar(uint32_t(0x31564b52));
+    out.scalar(cfg_.n_layer); out.scalar(cfg_.n_embd_k); out.scalar(cfg_.n_embd_v);
+    out.scalar(cfg_.block_tokens); out.scalar(cfg_.k_row_bytes);
+    out.scalar(cfg_.k_gpu_row_bytes); out.scalar(cfg_.v_gpu_row_bytes);
+    out.scalar(uint64_t(blocks_.size()));
+    // Per-block section length allows a future reader to build a disk index.
+    for (const auto & b : blocks_) {
+        uint64_t size = 0;
+        for (const auto & l : b.layers) size += 4*4 + 2 + 5*8 + l.k.size() + l.v.size()*2 +
+            l.k_gpu.size() + l.v_gpu.size() + l.k_sum.size()*4;
+        out.scalar(size);
+        for (const auto & l : b.layers) {
+            out.scalar(l.n_tokens); out.scalar(l.k_gpu_tokens);
+            out.scalar(l.v_gpu_tokens); out.scalar(l.mean_tokens);
+            out.scalar(uint8_t(l.k_gpu_fmt)); out.scalar(uint8_t(l.v_gpu_fmt));
+            out.vector(l.k); out.vector(l.v); out.vector(l.k_gpu); out.vector(l.v_gpu); out.vector(l.k_sum);
+        }
+    }
+}
+
+void RawKvStore::snapshot_read(SnapshotReader & in, uint32_t max_blocks) {
+    if (nvme_) throw std::runtime_error("session snapshots require RAM raw stores");
+    in.expect(uint32_t(0x31564b52));
+    in.expect(cfg_.n_layer); in.expect(cfg_.n_embd_k); in.expect(cfg_.n_embd_v);
+    in.expect(cfg_.block_tokens); in.expect(cfg_.k_row_bytes);
+    in.expect(cfg_.k_gpu_row_bytes); in.expect(cfg_.v_gpu_row_bytes);
+    const auto n = in.scalar<uint64_t>();
+    if (n > uint64_t(max_blocks) + 1 || n > in.remaining()/8)
+        throw std::runtime_error("invalid snapshot block count");
+    std::vector<BlockRaw> blocks(static_cast<size_t>(n));
+    for (auto & b : blocks) {
+        const auto size = in.scalar<uint64_t>();
+        const auto before = in.remaining();
+        if (size > before) throw std::runtime_error("truncated snapshot block");
+        b.layers.resize(cfg_.n_layer);
+        for (auto & l : b.layers) {
+            l.n_tokens = in.scalar<uint32_t>(); l.k_gpu_tokens = in.scalar<uint32_t>();
+            l.v_gpu_tokens = in.scalar<uint32_t>(); l.mean_tokens = in.scalar<uint32_t>();
+            if (std::max({l.n_tokens,l.k_gpu_tokens,l.v_gpu_tokens,l.mean_tokens}) > cfg_.block_tokens)
+                throw std::runtime_error("invalid snapshot token count");
+            const auto kfmt = in.scalar<uint8_t>(), vfmt = in.scalar<uint8_t>();
+            if (kfmt > 1 || vfmt > 1) throw std::runtime_error("invalid snapshot KV format");
+            l.k_gpu_fmt = kfmt; l.v_gpu_fmt = vfmt;
+            l.k = in.vector<uint8_t>(uint64_t(cfg_.block_tokens)*k_row_bytes());
+            l.v = in.vector<uint16_t>(uint64_t(cfg_.block_tokens)*cfg_.n_embd_v);
+            l.k_gpu = in.vector<uint8_t>(uint64_t(cfg_.block_tokens)*cfg_.k_gpu_row_bytes);
+            l.v_gpu = in.vector<uint8_t>(uint64_t(cfg_.block_tokens)*cfg_.v_gpu_row_bytes);
+            l.k_sum = in.vector<float>(cfg_.n_embd_k);
+            if ((l.k_gpu.size() < uint64_t(l.k_gpu_tokens)*cfg_.k_gpu_row_bytes) ||
+                (l.v_gpu.size() < uint64_t(l.v_gpu_tokens)*cfg_.v_gpu_row_bytes) ||
+                (l.mean_tokens && l.k_sum.size() != cfg_.n_embd_k))
+                throw std::runtime_error("incomplete snapshot KV block");
+        }
+        if (before - in.remaining() != size) throw std::runtime_error("invalid snapshot block size");
+    }
+    wait_writes();
+    std::lock_guard<std::mutex> lk(mu_);
+    blocks_.swap(blocks);
 }
 
 } // namespace kvmem

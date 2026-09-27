@@ -6,7 +6,12 @@
 
 #include "kvmem/kvmem_backend.hpp"
 #include "kvmem/kvmem_store.hpp"
+#if defined(_WIN32)
+// The POSIX implementation cannot be built on Windows; see the header.
+#include "kvmem/nvme_kv_tier_win.hpp"
+#else
 #include "kvmem/nvme_kv_tier.hpp"
+#endif
 #include "kvmem/pinned_kv_tier.hpp"
 
 #include <cstdint>
@@ -34,6 +39,26 @@ public:
     KvMemStore &store() { return store_; }
     const KvMemStore &store() const { return store_; }
     const KvMemPlan &last_plan() const { return last_plan_; }
+    // True while a prepared plan has not been applied yet (prepare_selection /
+    // prepare_prefill_pressure set it, admit_incoming clears it).
+    bool pending() const { return pending_; }
+    size_t allocated_bytes() const {
+        size_t bytes = sizeof(*this) + store_.allocated_bytes() + cpu_arena_.capacity() + scratch_.capacity();
+        bytes += last_plan_.stage_in.capacity()*sizeof(uint32_t) +
+            last_plan_.stage_out.capacity()*sizeof(uint32_t) + last_plan_.remaps.capacity()*sizeof(KvMemRemap);
+        bytes += pending_gpu_frees_.capacity()*sizeof(int32_t) + prefetch_futs_.capacity()*sizeof(std::future<void>);
+        for (const auto & entry : prefetch_buf_) if (entry.second) bytes += entry.second->capacity();
+        return bytes;
+    }
+    // Abandon a prepared plan instead of applying it. The staging half may
+    // already have run, so the caller owns putting its own view of residency
+    // back; this drops the pending marker and the GPU slots the plan had
+    // queued for admit_incoming() to free through the backend, which a caller
+    // that rebuilds its whole free-slot list does not need handed back.
+    void discard_pending() {
+        pending_ = false;
+        pending_gpu_frees_.clear();
+    }
 
     PinnedKvTier *cpu_tier() { return cpu_tier_.get(); }
     NvmeKvTier *nvme_tier() { return nvme_tier_.get(); }

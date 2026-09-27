@@ -20,8 +20,68 @@ import zlib
 from mtp_kv_ab import Sampler, stop_server
 
 ROOT = Path(__file__).resolve().parents[1]
-GPU = 'GPU-5847813c-9e6e-bb43-cc5e-621aac091b6c'
 OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+class RocmSampler(threading.Thread):
+    """Whole-device VRAM sampler with the same artifact format as Sampler."""
+
+    def __init__(self, gpu, folder):
+        super().__init__(daemon=True)
+        self.gpu, self.folder = gpu, folder
+        self.phase = 'loading'
+        self.stop_event = threading.Event()
+        self.rows = []
+        self.errors = []
+        self.error_count = 0
+
+    def run(self):
+        start = time.monotonic()
+        with (self.folder / 'vram.csv').open('w') as output:
+            writer = csv.writer(output)
+            writer.writerow(['elapsed_s', 'phase', 'used_mib', 'free_mib', 'reserved_mib',
+                             'temperature_c', 'sm_clock_mhz', 'power_w'])
+            while not self.stop_event.is_set():
+                try:
+                    result = subprocess.run(
+                        ['amd-smi', 'metric', '--mem-usage', '--gpu', str(self.gpu), '--json'],
+                        capture_output=True, text=True, check=True, timeout=5)
+                    memory = json.loads(result.stdout)['gpu_data'][0]['mem_usage']
+                    used = float(memory['used_vram']['value'])
+                    free = float(memory['free_vram']['value'])
+                    row = [time.monotonic() - start, self.phase, used, free, 0.0, None, None, None]
+                    self.rows.append(row)
+                    writer.writerow(row)
+                    output.flush()
+                except (KeyError, IndexError, ValueError, json.JSONDecodeError,
+                        OSError, subprocess.SubprocessError) as exc:
+                    self.error_count += 1
+                    if len(self.errors) < 8:
+                        self.errors.append(repr(exc))
+                self.stop_event.wait(0.15)
+
+    def finish(self):
+        self.stop_event.set()
+        self.join()
+        phases = {}
+        for phase in sorted({row[1] for row in self.rows}):
+            rows = [row for row in self.rows if row[1] == phase]
+            phases[phase] = {
+                'peak_mib': max(row[2] for row in rows),
+                'last_mib': rows[-1][2],
+                'min_free_mib': min(row[3] for row in rows),
+                'samples': len(rows),
+            }
+        return {
+            'peak_vram_mib': max((row[2] for row in self.rows), default=None),
+            'phase_metrics': phases,
+            'sample_count': len(self.rows),
+            'sampling_errors': self.errors,
+            'sampling_error_count': self.error_count,
+            'max_sample_gap_ms': max(
+                (b[0] - a[0] for a, b in zip(self.rows, self.rows[1:])), default=0) * 1000
+                if len(self.rows) > 1 else None,
+        }
 
 
 def fixture(size=896, changed=False):
@@ -50,9 +110,12 @@ def fixture(size=896, changed=False):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--binary', type=Path, default=ROOT / 'build/bin/llama-kvmem-server')
+    ap.add_argument('--gpu-api', choices=['auto', 'nvml', 'rocm'], default='auto')
+    ap.add_argument('--gpu-index', type=int, default=0)
     ap.add_argument('--model', type=Path, default=ROOT / 'models/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF/Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf')
     ap.add_argument('--mmproj', type=Path, default=ROOT / 'models/unsloth/Qwen3.8-27B-GGUF/mmproj-Q8_0.gguf')
     ap.add_argument('--no-projector', action='store_true')
+    ap.add_argument('--load-mode', choices=['auto', 'none', 'mmap', 'dio'], default='auto')
     ap.add_argument('--query-replay', choices=['legacy', 'auto'])
     ap.add_argument('--query-policy', choices=['legacy', 'user'])
     ap.add_argument('--mtp-state', choices=['snapshots', 'auto', 'replay'])
@@ -65,6 +128,8 @@ def main():
     ap.add_argument('--reserve', type=int, default=2048)
     ap.add_argument('--ctx', type=int, default=16384)
     ap.add_argument('--batch', type=int, default=512)
+    ap.add_argument('--threads', type=int, default=0,
+                    help='server/model and CPU projector threads; 0 keeps server defaults')
     ap.add_argument('--image-max-tokens', type=int, default=1024)
     ap.add_argument('--long-words', type=int, default=0)
     ap.add_argument('--port', type=int, default=18201)
@@ -80,6 +145,8 @@ def main():
     ap.add_argument('--long-context-benchmark', action='store_true',
                     help='Replay tool results until prompt plus generation nearly fills --ctx')
     ap.add_argument('--long-chunk-tokens', type=int, default=8192)
+    ap.add_argument('--max-tool-rounds', type=int, default=0,
+                    help='Stop a diagnostic long-context run after this many tool rounds; 0 runs to the final 256K round')
     ap.add_argument('--swap-stop-mib', type=int, default=512,
                     help='Stop the test if server VmSwap reaches this value')
     ap.add_argument('--system-swap-growth-stop-mib', type=int, default=1024)
@@ -105,6 +172,10 @@ def main():
         ap.error('--long-context-benchmark cannot be combined with another query benchmark')
     if args.long_chunk_tokens < 512:
         ap.error('--long-chunk-tokens must be at least 512')
+    if args.max_tool_rounds < 0 or (args.max_tool_rounds and not args.long_context_benchmark):
+        ap.error('--max-tool-rounds requires --long-context-benchmark and must be nonnegative')
+    if args.threads < 0:
+        ap.error('--threads must be nonnegative')
     if args.swap_stop_mib <= 0 or args.system_swap_growth_stop_mib <= 0:
         ap.error('swap stop thresholds must be positive')
     if args.no_projector and not (args.query_benchmark or args.query_quality or args.long_context_benchmark):
@@ -120,9 +191,21 @@ def main():
     part = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + encoded}}
     changed = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(fixture(changed=True)).decode()}}
     env = os.environ.copy()
-    env.update(CUDA_VISIBLE_DEVICES=GPU, CUDA_DEVICE_ORDER='PCI_BUS_ID',
-               LD_LIBRARY_PATH=str(args.binary.resolve().parent) + ':/home/leye/kvmem_qw3/.cu13-env/lib',
+    gpu_api = args.gpu_api
+    if gpu_api == 'auto':
+        gpu_api = 'rocm' if 'build-rocm' in args.binary.resolve().parts else 'nvml'
+    library_path = str(args.binary.resolve().parent)
+    inherited_libraries = env.get('LD_LIBRARY_PATH')
+    if inherited_libraries:
+        library_path += ':' + inherited_libraries
+    env.update(LD_LIBRARY_PATH=library_path,
                NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
+    if gpu_api == 'rocm':
+        env.pop('CUDA_VISIBLE_DEVICES', None)
+        env.pop('CUDA_DEVICE_ORDER', None)
+        env['HIP_VISIBLE_DEVICES'] = str(args.gpu_index)
+    else:
+        env.update(CUDA_VISIBLE_DEVICES=str(args.gpu_index), CUDA_DEVICE_ORDER='PCI_BUS_ID')
     if args.trace:
         env['KVMEM_TRACE'] = '1'
     cmd = [str(args.binary.resolve()),
@@ -133,6 +216,9 @@ def main():
            '--kvmem-block-tokens', '128', '--kv-dtype', args.kv,
            '--spec-type', args.spec, '--spec-draft-n-max', str(args.mtp), '--enable-thinking',
            '--reasoning-budget', str(args.thinking_budget if args.thinking_budget is not None else 0)]
+    cmd += ['--load-mode', args.load_mode]
+    if args.threads:
+        cmd += ['--threads', str(args.threads), '--threads-batch', str(args.threads)]
     if not args.no_projector:
         cmd += ['--mmproj', str(args.mmproj.resolve()),
                 '--mmproj-offload' if args.device == 'gpu' else '--no-mmproj-offload']
@@ -147,11 +233,16 @@ def main():
     if args.no_kvmem:
         cmd += ['--no-kvmem']
     (folder / 'argv.json').write_text(json.dumps(cmd, indent=2))
-    nvml = ctypes.CDLL('libnvidia-ml.so.1')
-    assert nvml.nvmlInit_v2() == 0
-    device = ctypes.c_void_p()
-    assert nvml.nvmlDeviceGetHandleByUUID(GPU.encode(), ctypes.byref(device)) == 0
-    sampler = Sampler(nvml, device, folder)
+    nvml = None
+    if gpu_api == 'rocm':
+        sampler = RocmSampler(args.gpu_index, folder)
+    else:
+        nvml = ctypes.CDLL('libnvidia-ml.so.1')
+        assert nvml.nvmlInit_v2() == 0
+        device = ctypes.c_void_p()
+        assert nvml.nvmlDeviceGetHandleByIndex_v2(
+            ctypes.c_uint(args.gpu_index), ctypes.byref(device)) == 0
+        sampler = Sampler(nvml, device, folder)
     def system_swap():
         raw = Path('/proc/meminfo').read_text()
         values = dict((k, int(v)) for k, v in re.findall(r'^(SwapTotal|SwapFree):\s+(\d+)', raw, re.M))
@@ -252,7 +343,7 @@ def main():
             chunks = [json.loads(line[6:]) for line in raw.splitlines() if line.startswith('data: {')]
             assert not any('error' in chunk for chunk in chunks), (label, raw)
             assert 'data: [DONE]' in raw, (label, raw)
-            text = ''.join(choice.get('delta', {}).get('content', '')
+            text = ''.join(choice.get('delta', {}).get('content') or ''
                            for chunk in chunks for choice in chunk.get('choices', []))
             for word in expected or []:
                 assert word in text.lower(), (label, word, text)
@@ -343,13 +434,18 @@ def main():
                 last_prompt = usage['prompt_tokens']
                 (folder / 'long-context.json').write_text(json.dumps({
                     'target_ctx': args.ctx, 'generation_limit': extra['max_tokens'],
-                    'rounds': rounds}, indent=2))
+                    'completed': final, 'rounds': rounds}, indent=2))
                 print('CONTEXT', last_prompt, '/', args.ctx, 'final', final, flush=True)
-                if final:
+                if final or (args.max_tool_rounds and len(rounds) >= args.max_tool_rounds):
                     break
-            assert rounds and rounds[-1]['final'], rounds[-1:] or 'no tool rounds'
-            assert args.ctx - 1024 <= last_prompt < args.ctx - extra['max_tokens'], last_prompt
+            assert rounds, 'no tool rounds'
             assert all(r['usage']['prompt_cache_hit_tokens'] > 0 for r in results[2:]), 'lost retained prefix'
+            if not args.max_tool_rounds or rounds[-1]['final']:
+                assert rounds[-1]['final'], rounds[-1:]
+                assert args.ctx - 1024 <= last_prompt < args.ctx - extra['max_tokens'], last_prompt
+                final_usage = results[-1]['usage'] or {}
+                assert final_usage.get('completion_tokens') == extra['max_tokens'], (
+                    'final code generation stopped before its token limit', final_usage)
             return
         if args.query_benchmark:
             tools = [{'type': 'function', 'function': {'name': 'read_file', 'description': 'Read source code',
@@ -547,18 +643,22 @@ def main():
     finally:
         rss_stop.set()
         rss_thread.join()
-        stats = sampler.finish()
-        stats['peak_process_rss_mib'] = max(rss_samples, default=0)
-        stats['peak_runtime_rss_mib'] = max((v for k, v in rss_phase_peaks.items() if k != 'loading'), default=None)
-        stats['peak_loading_rss_mib'] = rss_phase_peaks.get('loading')
-        stats['phase_rss_peak_mib'] = rss_phase_peaks
-        stats['swap_stop'] = swap_stop or None
-        stats.update(options=vars(args), requests=results)
-        (folder / 'summary.json').write_text(json.dumps(stats, indent=2, ensure_ascii=False, default=str))
-        print('PEAK_MIB', stats['peak_vram_mib'], flush=True)
-        if swap_stop or not args.keep_server:
-            stop_server(proc)
-        nvml.nvmlShutdown()
+        try:
+            stats = sampler.finish()
+            stats['peak_process_rss_mib'] = max(rss_samples, default=0)
+            stats['peak_runtime_rss_mib'] = max((v for k, v in rss_phase_peaks.items() if k != 'loading'), default=None)
+            stats['peak_loading_rss_mib'] = rss_phase_peaks.get('loading')
+            stats['phase_rss_peak_mib'] = rss_phase_peaks
+            stats['swap_stop'] = swap_stop or None
+            stats['gpu_api'] = gpu_api
+            stats.update(options=vars(args), requests=results)
+            (folder / 'summary.json').write_text(json.dumps(stats, indent=2, ensure_ascii=False, default=str))
+            print('PEAK_MIB', stats['peak_vram_mib'], flush=True)
+        finally:
+            if swap_stop or not args.keep_server:
+                stop_server(proc)
+            if nvml is not None:
+                nvml.nvmlShutdown()
 
 
 if __name__ == '__main__':

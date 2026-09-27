@@ -70,7 +70,8 @@ class LauncherTests(unittest.TestCase):
             sock.bind(('127.0.0.1', 0))
             self.port = sock.getsockname()[1]
         self.env = os.environ.copy()
-        for key in ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'MODEL', 'MMPROJ', 'MMPROJ_DEVICE',
+        for key in ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'MALLOC_ARENA_MAX',
+                    'MODEL', 'MMPROJ', 'MMPROJ_DEVICE',
                     'BUILD_DIR', 'SPEC_KV_DTYPE', 'SPEC_DRAFT_N_MAX', 'KVMEM_MTP_STATE',
                     'KVMEM_QUERY_REPLAY', 'KVMEM_QUERY_POLICY',
                     'IMAGE_MAX_TOKENS', 'TEST_EXIT', 'TEST_DELAY', 'TEST_BAD_HELP'):
@@ -216,7 +217,7 @@ class LauncherTests(unittest.TestCase):
         data = json.loads(self.run_recipe('iq3', '--dry-run').stdout)
         self.assertEqual(data['environment']['CUDA_VISIBLE_DEVICES'], 'GPU-big')
         self.assertIn(str(self.model), data['argv'])
-        self.assertIn('--mmproj-offload', data['argv'])
+        self.assertIn('--no-mmproj-offload', data['argv'])
         self.assertNotIn('--spec-draft-n-max', data['argv'])
         self.assertNotIn('--kvmem-mtp-state', data['argv'])
         self.assertFalse((self.root / 'BAD').exists())
@@ -267,6 +268,23 @@ class LauncherTests(unittest.TestCase):
         self.assertIn('already up', self.run_recipe('iq4').stdout)
         result = self.run_recipe('iq4', overrides={'CUDA_VISIBLE_DEVICES': 'GPU-other'}, success=False)
         self.assertIn('different configuration', result.stderr)
+
+    def test_arena_limit_reuse_and_override(self):
+        self.assertEqual(json.loads(self.run_recipe('iq3', '--dry-run').stdout)
+                         ['environment']['MALLOC_ARENA_MAX'], '2')
+        self.run_recipe()
+        first = self.pid()
+        self.assertIn(b'MALLOC_ARENA_MAX=2\0', (Path('/proc') / str(first) / 'environ').read_bytes())
+        self.assertIn('already up', self.run_recipe().stdout)
+
+        changed = self.run_recipe(overrides={'MALLOC_ARENA_MAX': '8'}, success=False)
+        self.assertIn('--restart', changed.stderr)
+        self.assertEqual(self.pid(), first)
+        self.run_recipe('iq3', '--restart', overrides={'MALLOC_ARENA_MAX': '8'})
+        second = self.pid()
+        self.assertNotEqual(first, second)
+        self.assertIn(b'MALLOC_ARENA_MAX=8\0', (Path('/proc') / str(second) / 'environ').read_bytes())
+        self.assertIn('already up', self.run_recipe(overrides={'MALLOC_ARENA_MAX': '8'}).stdout)
 
     def test_preflight_failure_preserves_server(self):
         self.run_recipe()

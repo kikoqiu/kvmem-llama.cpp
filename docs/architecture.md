@@ -31,6 +31,17 @@ slot; only `stage_out` cells are `seq_rm`'d. Flash Attention is not
 modified. P1 recency does not re-RoPE and does not resurrect dropped
 blocks.
 
+The host store is per conversation; the GPU working set and the `llama_context`
+stay single. `--kvmem-conversations N` keeps N host stores alive and
+time-multiplexes them, so a conversation that returns after another was served
+does not have to be reprocessed. A switch drains the whole working set to host
+and rebuilds the incoming store's through the drain-and-restage path that
+already runs inside a conversation (the host fallback in
+`layout_gpu_slots_by_orig_pos` and `write_block_to_gpu` in
+`src/adapter/llama-memory-kvmem.cpp`), not a second implementation. Requests
+stay serialized and `n_seq_max` stays 1; the recurrent half is still a
+server-side byte snapshot restored per request.
+
 Hardware split on this machine: RTX 5050 (GPU 0) for models < 27B;
 RTX 5090 (GPU 1) for 27B. Details in `scripts/gpu.sh` and
 `docs/modification-plan.md`.
@@ -97,8 +108,8 @@ blocks would drop the query’s retrieved facts, so the swap reselects with
 the query still mandatory. Growing `budget +
 gen_reserve` on 16 GiB is also out: recipes already sit near 15.5 GiB.
 Streaming the whole generation through VRAM would bring back the
-adaptive-KV-streaming cost curve. NVMe is not implemented in this port;
-host RAM is enough for spilled gen KV.
+adaptive-KV-streaming cost curve. The optional NVMe session cache stores idle
+sessions, while generation spill remains in host RAM.
 
 ### What the swap keeps
 

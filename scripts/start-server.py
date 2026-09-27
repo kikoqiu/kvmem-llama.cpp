@@ -180,7 +180,7 @@ def same_config(info, argv, env):
         raw = (Path('/proc') / str(info['pid']) / 'environ').read_bytes()
         values = dict(part.split(b'=', 1) for part in raw.split(b'\0') if b'=' in part)
         return all(values.get(key.encode()) == env[key].encode()
-                   for key in ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER'))
+                   for key in ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'MALLOC_ARENA_MAX'))
     except (FileNotFoundError, PermissionError):
         return False
 
@@ -300,6 +300,7 @@ def main():
     ap.add_argument('--startup-timeout', type=float, default=180)
     args = ap.parse_args()
     env = os.environ.copy()
+    env.setdefault('MALLOC_ARENA_MAX', '2')
     binary = (Path(env.get('BUILD_DIR', str(ROOT / 'build'))) / 'bin/llama-kvmem-server').resolve()
     port = int(env.get('PORT', '18200'))
     host = args.host or env.get('HOST') or env.get('LLAMA_ARG_HOST') or '127.0.0.1'
@@ -398,7 +399,8 @@ def main():
         argv += ['--jinja']
     if args.dry_run:
         print(json.dumps(dict(argv=argv, environment={k: env[k] for k in
-                         ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'LD_LIBRARY_PATH')}), indent=2))
+                         ('CUDA_VISIBLE_DEVICES', 'CUDA_DEVICE_ORDER', 'LD_LIBRARY_PATH',
+                          'MALLOC_ARENA_MAX')}), indent=2))
         return
     # Resolve shared-library failures before stopping an existing working service.
     subprocess.run([str(binary), '--help'], env=env, stdout=subprocess.DEVNULL,
