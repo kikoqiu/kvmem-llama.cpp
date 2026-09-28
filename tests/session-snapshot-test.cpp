@@ -34,6 +34,7 @@ static void large_file() {
             }
         });
     }
+    std::filesystem::remove(root / kvmem_session_cache_dir::root_lock_name());
     std::filesystem::remove(root);
     std::cout << ">4 GiB streaming file roundtrip and quota passed\n";
 }
@@ -134,6 +135,8 @@ int main(int argc, char ** argv) {
         check(std::filesystem::exists(sentinel));
     }
     check(!std::filesystem::exists(run) && std::filesystem::exists(sentinel));
-    std::filesystem::remove(sentinel); std::filesystem::remove(root);
+    std::filesystem::remove(sentinel);
+    std::filesystem::remove(root / kvmem_session_cache_dir::root_lock_name());
+    std::filesystem::remove(root);
     std::cout << "snapshot roundtrip, bounds, checksum, quota, short write and cleanup passed\n";
 }

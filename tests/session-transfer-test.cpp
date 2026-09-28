@@ -249,6 +249,7 @@ static void raw_roundtrip() {
             check(raw.copy_v_gpu(block, l, got.data(), n) && !std::memcmp(got.data(), expected.data()+block*64*68, got.size()), "raw V mismatch");
         }
     }
+    std::filesystem::remove(root / kvmem_session_cache_dir::root_lock_name());
     std::filesystem::remove(root);
 }
 

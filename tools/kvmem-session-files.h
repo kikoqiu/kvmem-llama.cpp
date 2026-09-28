@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kvmem/snapshot.hpp"
+#include "kvmem-session-cache-dir.h"
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -10,34 +11,21 @@
 
 using kvmem_session_corrupt = kvmem::SnapshotCorrupt;
 
-// Private to one server run. Only tracked files are removed; other runs and
-// user files in the configured directory are never swept. Temporary files are
-// charged before the first write and remain charged if removal fails.
+// Private to one server run. Its directory lease protects live snapshots from
+// startup cleanup by other servers. Temporary files are charged before the
+// first write and remain charged if removal fails.
 class kvmem_session_files {
 public:
-    kvmem_session_files(const std::filesystem::path & root, uint64_t limit) : limit_(limit) {
-        std::filesystem::create_directories(root);
-        for (int attempt = 0; attempt < 32; ++attempt) {
-            dir_ = root / ("run-" + std::to_string(std::chrono::high_resolution_clock::now().time_since_epoch().count()) +
-                           "-" + std::to_string(std::random_device{}()));
-            if (std::filesystem::create_directory(dir_)) {
-                std::filesystem::permissions(dir_, std::filesystem::perms::owner_all,
-                                             std::filesystem::perm_options::replace);
-                return;
-            }
-        }
-        throw std::runtime_error("cannot create private session cache directory");
-    }
-    ~kvmem_session_files() {
-        for (const auto & entry : files_) { std::error_code ec; std::filesystem::remove(entry.second.path, ec); }
-        std::error_code ec; std::filesystem::remove(dir_, ec);
-    }
+    kvmem_session_files(const std::filesystem::path & root, uint64_t limit,
+                       kvmem_session_cache_dir::log_fn log = {})
+        : cache_dir_(root, std::move(log)), dir_(cache_dir_.directory()), limit_(limit) {}
     kvmem_session_files(const kvmem_session_files &) = delete;
     kvmem_session_files & operator=(const kvmem_session_files &) = delete;
     uint64_t bytes() const { return bytes_; }
     uint64_t limit() const { return limit_; }
     uint64_t available() const { return std::filesystem::space(dir_).available; }
     const std::filesystem::path & directory() const { return dir_; }
+    const kvmem_session_cache_dir::cleanup_result & startup_cleanup() const { return cache_dir_.startup_cleanup(); }
     // Optional deterministic fault injection for the portable transfer tests.
     std::function<void(const char *, int, uint32_t)> fault;
     std::filesystem::path path(int id, uint32_t chunk = 0) const { return files_.at({id, chunk}).path; }
@@ -70,7 +58,7 @@ public:
         try { if (fault) fault("erase", id, chunk); } catch (...) { return false; }
         std::error_code ec;
         std::filesystem::remove(it->second.path, ec);
-        if (ec) return false;
+        if (ec) { cache_dir_.report(true, "cannot remove " + it->second.path.u8string() + ": " + ec.message()); return false; }
         bytes_ -= it->second.bytes; files_.erase(it); return true;
     }
     template<class Write> void save(int id, uint64_t payload_bytes, const Write & write) {
@@ -130,6 +118,7 @@ public:
     }
 private:
     struct record { std::filesystem::path path; uint64_t bytes; bool ready; };
+    kvmem_session_cache_dir cache_dir_;
     std::filesystem::path dir_;
     std::map<std::pair<int, uint32_t>, record> files_;
     uint64_t bytes_ = 0, limit_;

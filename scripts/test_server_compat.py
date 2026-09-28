@@ -61,6 +61,14 @@ try:
         # "invalid arguments (source=...)" line the loop below asserts on.
         ['--kvmem-conversations-gb', '24'],
         ['--no-kvmem', '--kvmem-conversations', '2'],
+        ['--kvmem-session-nvme-gb', 'nan'], ['--kvmem-session-nvme-gb', '-1'],
+        ['--kvmem-session-nvme-gb', 'inf'], ['--kvmem-session-ram-gb', 'nan'],
+        ['--kvmem-session-cache-dir', str(out / 'unused-session-cache')],
+        ['--kvmem-session-nvme-gb', '2'],
+        ['--kvmem-conversations', '3', '--kvmem-session-nvme-gb', '2'],
+        *[['--kvmem-conversations', '3', '--kvmem-session-nvme-gb', '2',
+           '--kvmem-session-cache-dir', str(out / 'unused-session-cache'), *tier]
+          for tier in (['--kvmem-cpu-gb', '1'], ['--kvmem-nvme-gb', '1'], ['--kvmem-raw-k-nvme'])],
     ]
     for flags in invalid:
         r = subprocess.run([a.server, '-m', '__nonexistent__.gguf', *flags], env=env,
@@ -75,10 +83,14 @@ try:
                   ['--predict', '256', '-s', '123', '-mm', 'projector.gguf', '--no-webui'],
                   ['--timeout', '60', '--threads-http', '2', '--device', 'none'],
                   ['--kvmem-conversations', '1'],
-                  ['--kvmem-conversations', '8', '--kvmem-conversations-gb', '24']]:
+                  ['--kvmem-conversations', '8', '--kvmem-conversations-gb', '24'],
+                  ['--kvmem-conversations', '3', '--kvmem-session-ram-gb', '0'],
+                  ['--kvmem-conversations', '3', '--kvmem-session-ram-gb', '0.01',
+                   '--kvmem-session-nvme-gb', '2', '--kvmem-session-cache-dir', str(out / 'unused-session-cache')]]:
         r = subprocess.run([a.server, '-m', '__nonexistent__.gguf', *flags], env=env,
                            capture_output=True, timeout=20)
         check('accept ' + ' '.join(flags), b'failed to load model' in r.stderr)
+    check('invalid or model-less startup creates no session cache', not (out / 'unused-session-cache').exists())
     r = subprocess.run([a.server, '--usage'], env=env, capture_output=True, timeout=20)
     check('--usage alias', r.returncode == 0 and b'usage:' in r.stderr)
     r = subprocess.run([a.server, '--list-devices'], env=env, capture_output=True, timeout=20)

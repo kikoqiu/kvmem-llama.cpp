@@ -17,7 +17,7 @@ p.add_argument('--model', required=True)
 p.add_argument('--output', required=True)
 p.add_argument('--mtp', action='store_true')
 p.add_argument('--lines', type=int, default=280)
-p.add_argument('--gpu-layers', type=int, default=99, help='model layers to offload to the selected GPU')
+p.add_argument('--gpu-layers', default='99', help='layers to offload; use all for multi-GPU')
 p.add_argument('--mtp-state', choices=('auto', 'snapshots', 'replay'), default='replay',
                help='auto supports model shapes outside the specialized 27B replay kernel')
 a = p.parse_args()
@@ -144,6 +144,9 @@ def run(label, ram=8, disk=8, sequence=('A', 'B', 'C', 'A', 'B', 'C'), corrupt=F
                 counters = request(base, '/slots')[1][0]['kvmem']['conversations']
                 check(f'{label} {index} disk quota and session count',
                     counters['disk_bytes'] <= counters['disk_bytes_max'] and counters['count'] <= 3)
+                on_disk = sum(path.stat().st_size for path in cache.glob('run-*/*')
+                              if path.suffix in ('.kv', '.tmp'))
+                check(f'{label} {index} charged disk bytes match files', counters['disk_bytes'] == on_disk)
                 turns.append({'channel': name, 'answer': answer, 'usage': result['usage'], 'counters': counters})
         finally:
             proc.terminate()
@@ -188,6 +191,10 @@ try:
     for i in range(3, 6):
         check(f'disk turn {i} reuses its cached prefix', cached[i]['usage']['prompt_cache_hit_tokens'] > 1024)
         check(f'disk turn {i} matches RAM answer', cached[i]['answer'] == reference[i]['answer'])
+    count_lru, trace = run('count-lru', ram=ram, sequence=('A','B','C','A','D','C','B'))
+    check('disk-mode count cap uses LRU', 'reason=lru' in trace and count_lru[4]['counters']['evictions'] > 0)
+    check('count cap preserves recently used C', count_lru[5]['usage']['prompt_cache_hit_tokens'] > 1024)
+    check('count cap discards oldest B', count_lru[6]['usage']['prompt_cache_hit_tokens'] == 0)
     broken, trace = run('corrupt-fallback', ram=ram, sequence=('A','B','C','A'), corrupt=True)
     check('corrupt snapshot counted', broken[-1]['counters']['disk_errors'] >= 1)
     check('corrupt snapshot recomputed', broken[-1]['usage']['prompt_cache_hit_tokens'] == 0)

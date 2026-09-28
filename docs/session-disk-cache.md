@@ -108,13 +108,42 @@ one running process, not durable restart or power-loss recovery.
 
 These files are **only valid within the same server run**. Their small in-memory
 indexes include model/runtime identity. Each run creates a unique subdirectory
-and removes only its own tracked files on graceful exit. A forcibly terminated
-process can leave an orphan run directory; it is not loaded or swept by a later
-server. Remove obsolete run directories yourself while those servers are
-stopped. Quotas apply to each server run, not all servers sharing a drive.
+with a versioned `.kvmem-owner` marker and holds an exclusive OS file lock for
+its lifetime. Graceful destruction removes that run's cache. Forced termination
+can leave files behind, but the OS releases the lock.
+
+On the next startup with session disk caching enabled, the server reclaims
+marked run directories whose locks it can acquire. It removes complete `.kv`
+chunks and unfinished `.tmp` chunks before creating its new run. Other live
+servers sharing the root are skipped. A persistent `.kvmem-cache.lock` file
+serializes scanning, registration and graceful cleanup; do not delete or replace
+this small control file while any server uses the root. PID reuse and elapsed
+time are not used to decide ownership. Use a local filesystem with working OS
+file locks; shared/network filesystem locking is outside this contract.
+
+Cleanup never recurses into directories or follows links/reparse points.
+Unknown marker formats and directories containing unexpected entries are left
+untouched. Legacy run directories without a marker are also preserved: remove
+those manually only after confirming the old servers have stopped. Startup logs
+report removed directories and bytes, live/skipped directories, and errors.
+Failed chunk deletion retains the marker for a later retry and logs the path and
+reason; it does not prevent a new run from starting. A crash before registration
+finishes may leave an unmarked directory, but no snapshots have been written yet.
+Quotas still apply to each server run, not all servers sharing a drive. Skipped
+or undeletable leftovers consume real disk space outside the new run's quota.
 
 The active session is loaded entirely into RAM. Restart persistence and
 per-block paging of an active session are outside this implementation.
+
+The portable `kvmem-session-cache-lifecycle-test` (CTest, when Python 3 is
+available) starts real child processes, kills them during snapshot writes,
+checks live-session restoration while another process cleans, races 12 startups,
+and verifies graceful cleanup, legacy/user-file preservation, link exclusion,
+and deletion-failure logging/retry. No model or GPU is needed. Run it with:
+
+```sh
+ctest --test-dir build --output-on-failure -R kvmem-session-cache-lifecycle-test
+```
 
 ## Diagnostics and checks
 
@@ -157,6 +186,43 @@ outside the specialized 27B replay kernel (for example the local 0.8B model).
 The script starts only its own server processes on unused ports and downloads
 no models. On Windows it also locks a middle snapshot chunk to force a real
 HTTP 503, resumes the old session, and retries the target with cache hits intact.
+For an explicit multi-GPU configuration, pass `--gpu-layers all` and supply
+the server's device/split settings through `LLAMA_ARG_DEVICE`,
+`LLAMA_ARG_SPLIT_MODE`, and `LLAMA_ARG_TENSOR_SPLIT`.
+It also checks count-based LRU with four histories under a three-session cap,
+and reconciles the charged disk bytes with actual snapshot file lengths after
+each successful request.
+
+For HTTP-level concurrency, Chat/Responses streaming, optional-ID fallback,
+cancelled generation, and actual server crash/restart with another live server
+sharing the cache root:
+
+```text
+python scripts/test_server_session_lifecycle.py --server PATH/llama-kvmem-server --model PATH/small-model.gguf --gpu GPU-UUID --mtp --output artifacts/session-lifecycle
+```
+
+This fixture runs two copies of the supplied model concurrently during its
+shared-root phase; use a small model that fits twice on the selected GPU.
+Run with and without `--mtp` to cover both generation paths. The default eight
+rounds submit A/B/C simultaneously over HTTP, while the server continues to
+serialize inference through its one active slot.
+
+Image sessions have a separate real-model check. It switches between red, blue
+and green images, restores their KV from disk, then changes only the image in
+an otherwise identical prompt with the same client ID. The changed image must
+miss the old cache and answer yellow; the original red history must remain
+reusable. This fixture uses mixed K8/V4 KV and MTP snapshots:
+
+```text
+python scripts/test_server_session_multimodal.py --server PATH/llama-kvmem-server --model PATH/model.gguf --mmproj PATH/mmproj.gguf --gpu GPU-UUID --output artifacts/session-images
+```
+
+### Full validation (Windows, 2026-09-27 to 2026-09-28)
+
+See [the multi-session validation report](multi-session-validation-2026-09-27.md)
+for the 5050 / 5060 Ti matrix, shared-root crash recovery, image sessions,
+three approximately 5 GiB sessions under a 10 GiB NVMe quota, and matched
+restore-versus-prefill timings.
 
 ### Local verification (Windows, 2026-09-26)
 

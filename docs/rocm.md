@@ -54,7 +54,10 @@ The complete source bundle already includes the pinned llama.cpp sources.
 Build scripts apply `patches/llama-kvmem-current.patch` idempotently and stop on conflicts.
 Use separate build directories for each operating system and SDK version.
 
-Common requirements: Python 3, Git, CMake >= 3.24, Ninja, a compatible ROCm/HIP SDK.
+Common requirements: Python 3, Git, CMake >= 3.24, and a compatible ROCm/HIP SDK.
+Ninja is preferred; on Linux the build script falls back to Unix Makefiles when
+Ninja is unavailable. Distro-provided LLVM can be used when the ROCm SDK does not
+bundle `llvm/bin`.
 Windows additionally needs Visual Studio 2022 C++ Build Tools and a Windows SDK.
 This build was developed with MSVC 14.44; later toolchains need separate validation.
 Linux needs the normal C/C++ development headers.
@@ -130,5 +133,7 @@ If a GPU fails, attach `--list-devices`, the architecture probe output, compiler
 `BUILD-INFO.json` (for a package), startup log and a minimal command to reproduce it.
 Do not use a different architecture override to disguise an unsupported GPU.
 
-The existing CUDA launchers and CUDA packages remain separate. NVMe offload is disabled.
+The existing CUDA launchers and CUDA packages remain separate. The legacy
+raw-block NVMe tier is disabled; the optional process-local session disk cache
+is a separate feature described in [Session disk cache](session-disk-cache.md).
 The original contributions and integration choices are recorded in [rocm-contributors.md](rocm-contributors.md).

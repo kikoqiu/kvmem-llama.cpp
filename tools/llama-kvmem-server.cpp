@@ -2895,7 +2895,11 @@ int main(int argc, char ** argv) {
             if (options.session_disk_bytes) {
                 try {
                     st.session_files = std::make_unique<kvmem_session_files>(
-                        std::filesystem::u8path(options.session_cache_dir), options.session_disk_bytes);
+                        std::filesystem::u8path(options.session_cache_dir), options.session_disk_bytes,
+                        [](bool warning, const std::string & message) {
+                            if (warning) { LOG_WRN("srv    KVMEM session cache %s\n", message.c_str()); }
+                            else { LOG_INF("srv    KVMEM session cache %s\n", message.c_str()); }
+                        });
                 } catch (const std::exception & e) {
                     LOG_ERR("srv    KVMEM session cache initialization failed: %s\n", e.what()); return 1;
                 }
