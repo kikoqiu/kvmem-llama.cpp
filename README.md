@@ -97,6 +97,22 @@ The recipes and conversion commands below document the historical tested setup.
 
 ## Clone, patch, build
 
+**This tree is a source-only submodule here.** The
+[llama.cpp-kvmem](https://github.com/kikoqiu/llama.cpp-kvmem) fork vendors this
+repository as `kvmem-llama.cpp` and builds its sources through the parent
+project (`LLAMA_KVMEM_ROOT`), so `cmake -S .` in this directory is not part of
+the workflow and no binary is produced here. Edit a file here and the parent's
+next build of `llama-kvmem-server` compiles it; build the parent instead:
+
+```bash
+cd build
+cmake .. -DGGML_CUDA=ON -DLLAMA_KVMEM=ON
+cmake --build . --config Release --target llama-kvmem-server
+```
+
+The standalone recipe below is the upstream project's own flow, kept for
+reference.
+
 Building uses a C++17 compiler, CMake and **CUDA Toolkit 13.2 Update 2 (nvcc 13.2.86) or newer**. The Linux startup scripts use Python 3.10+ and `ss` (iproute2).
 
 **CUDA compiler version matters for correctness.** The validated baseline is nvcc **13.2.86** on Linux/WSL2 and native Windows. A Windows build made with nvcc 13.2.51 produced garbage output from Qwen3.8-27B IQ3_S even with KVMem and MTP disabled; rebuilding unchanged source with 13.2.86 restored correct output. A successful build, health check or small Q8 model test does not validate IQ3 inference. Newer toolchains still need correctness testing before release.
