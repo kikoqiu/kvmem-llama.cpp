@@ -24,11 +24,11 @@ The numbered `0001` through `0004` files are historical patches, retained for
 reference. They are superseded by the cumulative diff: the old series did
 not cleanly replay on the current pin and must not be applied together with it.
 
-To check a clean extraction without changing the active submodule:
+To check a clean extraction without changing your active llama.cpp checkout:
 
 ```bash
-mkdir -p /tmp/kvmem-llama-patch-check
-git -C llama.cpp archive b81c99b | tar -x -C /tmp/kvmem-llama-patch-check
+git clone https://github.com/ggml-org/llama.cpp /tmp/kvmem-llama-patch-check
+git -C /tmp/kvmem-llama-patch-check checkout b81c99b
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 ```

@@ -62,7 +62,7 @@ For example, add `--kvmem-conversations 3 --kvmem-session-ram-gb 12 --kvmem-sess
 
 `kvmem/` holds the host store and retrieval logic; `src/adapter/` connects it through llama.cpp’s memory interface. Attention kernels and original positions stay unchanged. Reselection transfers only blocks that changed.
 
-Do **not** commit a dirty `llama.cpp` working tree. The submodule pointer is the pin; `scripts/apply-patches.sh` replays `patches/`.
+Do **not** commit a `llama.cpp` checkout into this tree. The llama.cpp side lives in `patches/`; `scripts/apply-patches.sh` replays it onto the pin.
 
 ## Tested platform
 
@@ -106,15 +106,16 @@ Check `nvcc --version` for the compiler selected by CMake; `release 13.2` alone 
 An experimental [native Windows build](scripts/windows/README.md) is being validated. It disables the legacy raw-block NVMe tier and includes PowerShell launchers; the session snapshot cache described above is independent of that build option. The performance results below remain Linux/WSL2 measurements.
 
 ```bash
-git clone --recurse-submodules https://github.com/kvmem/kvmem-llama.cpp.git
+git clone https://github.com/kvmem/kvmem-llama.cpp.git
 cd kvmem-llama.cpp
 git checkout v0.16.0-rc3
-git submodule update --init
+git clone https://github.com/ggml-org/llama.cpp llama.cpp
+git -C llama.cpp checkout b81c99b
 scripts/apply-patches.sh
 scripts/build-cuda.sh
 ```
 
-The submodule is ggml-org/llama.cpp at pin `b81c99b`. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
+The patches target ggml-org/llama.cpp at pin `b81c99b`. This tree does not track llama.cpp: the standalone build above clones it into `llama.cpp/`, and `KVMEM_BUILD_LLAMA=ON` (the default) builds that directory. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
 
 `scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
 
@@ -562,7 +563,7 @@ tools/            llama-kvmem-cli, llama-kvmem-server, vision helpers
 scripts/          apply-patches, CUDA build, GPU bind, start helpers
 patches/          Diffs against the llama.cpp pin
 docs/             Architecture, milestones, multimodal
-llama.cpp/        Submodule (pin only; apply patches after clone)
+llama.cpp/        llama.cpp checkout the patches apply to (not tracked)
 models/           Local GGUFs (gitignored)
 ```
 
