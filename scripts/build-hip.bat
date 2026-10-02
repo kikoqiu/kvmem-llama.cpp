@@ -183,7 +183,7 @@ if "%CONFIGURE_ONLY%"=="1" (
 )
 
 echo.
-echo [3/3] Building. GGML_CUDA_FA_ALL_QUANTS is forced ON by CMakeLists.txt
+echo [3/3] Building. GGML_CUDA_FA_QUANTS=all is forced by CMakeLists.txt
 echo       ^(required for --kv-dtype q5_0^), so all 49 fattn-vec instances
 echo       compile -- expect a long first build.
 cmake --build "%BUILD_DIR%" --config Release -j%JOBS%

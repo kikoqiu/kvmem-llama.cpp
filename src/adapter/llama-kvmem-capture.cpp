@@ -1,4 +1,5 @@
 #include "llama-kvmem-capture.h"
+#include "llama-kvmem-execution.h"
 
 #include "llama-kvmem-hooks.h"
 #include "llama-memory-kvmem.h"
@@ -11,81 +12,79 @@
 #include <string>
 #include <vector>
 
-static llama_memory_kvmem * g_mem = nullptr;
-static llama_memory_kvmem_mtp * g_mtp = nullptr;
 
 void kvmem_capture_bind(llama_memory_kvmem * mem) {
-    g_mem = mem;
+    kvmem_current_execution().memory = mem;
 }
 
 llama_memory_kvmem * kvmem_capture_active() {
-    return g_mem;
+    return kvmem_current_execution().memory;
 }
 
 void kvmem_capture_unbind(llama_memory_kvmem * mem) {
-    if (g_mem == mem) {
-        g_mem = nullptr;
+    if (kvmem_current_execution().memory == mem) {
+        kvmem_current_execution().memory = nullptr;
     }
 }
 
 void kvmem_mtp_bind(llama_memory_kvmem_mtp * mem) {
-    g_mtp = mem;
+    kvmem_current_execution().mtp = mem;
 }
 
 void kvmem_mtp_unbind(llama_memory_kvmem_mtp * mem) {
-    if (g_mtp == mem) {
-        g_mtp = nullptr;
+    if (kvmem_current_execution().mtp == mem) {
+        kvmem_current_execution().mtp = nullptr;
     }
 }
 
 void kvmem_capture_note_ubatch(const std::vector<llama_pos> & pos) {
-    if (g_mem) {
-        g_mem->note_ubatch_pos(pos);
+    if (kvmem_current_execution().memory) {
+        kvmem_current_execution().memory->note_ubatch_pos(pos);
     }
 }
 
 void kvmem_capture_reset_q() {
-    if (g_mem) {
-        g_mem->reset_query_acc();
+    if (kvmem_current_execution().memory) {
+        kvmem_current_execution().memory->reset_query_acc();
     }
 }
 
 void kvmem_capture_register(struct ggml_tensor * t, int il, char which) {
-    if (g_mtp && g_mtp->is_mtp_layer(il)) {
-        g_mtp->register_capture(t, il, which);
+    if (kvmem_current_execution().mtp && kvmem_current_execution().mtp->is_mtp_layer(il)) {
+        kvmem_current_execution().mtp->register_capture(t, il, which);
         return;
     }
-    if (g_mem) {
-        g_mem->register_capture(t, il, which);
+    if (kvmem_current_execution().memory) {
+        kvmem_current_execution().memory->register_capture(t, il, which);
     }
 }
 
 void kvmem_capture_on_new_graph(int is_mtp) {
     if (is_mtp) {
-        if (g_mtp) {
-            g_mtp->capture_on_new_graph();
+        if (kvmem_current_execution().mtp) {
+            kvmem_current_execution().mtp->capture_on_new_graph();
         }
         return;
     }
-    if (g_mem) {
-        g_mem->capture_on_new_graph();
+    if (kvmem_current_execution().memory) {
+        kvmem_current_execution().memory->capture_on_new_graph();
     }
 }
 
 void kvmem_capture_harvest_ubatch(struct ggml_backend_sched * sched, int is_mtp) {
     if (is_mtp) {
-        if (g_mtp) {
-            g_mtp->harvest_pending(sched);
+        if (kvmem_current_execution().mtp) {
+            kvmem_current_execution().mtp->harvest_pending(sched);
         }
         return;
     }
-    if (g_mem) {
-        g_mem->harvest_pending(sched);
+    if (kvmem_current_execution().memory) {
+        kvmem_current_execution().memory->harvest_pending(sched);
     }
 }
 
 static bool ubatch_overlaps_query(uint32_t n_tokens, uint32_t n_pos, const llama_pos * pos) {
-    if (g_mem) return g_mem->query_overlaps(n_tokens, pos);
+    if (kvmem_current_execution().memory) return kvmem_current_execution().memory->query_overlaps(n_tokens, pos);
     const llama_kvmem_params * kp = llama_kvmem_get_params();
     if (!kp || !kp->enabled || kp->method != 1 || kp->query_begin < 0 || n_tokens == 0) {
         return false;
@@ -113,10 +112,10 @@ bool kvmem_capture_can_reuse(uint32_t n_tokens, uint32_t n_pos, const llama_pos 
     if (is_mtp) {
         return true;
     }
-    if (!g_mem) {
+    if (!kvmem_current_execution().memory) {
         return true;
     }
-    return g_mem->capture_can_reuse(n_tokens, n_pos, pos);
+    return kvmem_current_execution().memory->capture_can_reuse(n_tokens, n_pos, pos);
 }
 
 bool llama_kvmem_eval_callback(struct ggml_tensor * /*t*/, bool /*ask*/, void * /*user_data*/) {
@@ -143,4 +142,9 @@ bool llama_kvmem_ubatch_needs_q_capture(uint32_t n_tokens, uint32_t n_pos, const
 
 bool llama_kvmem_capture_can_reuse(uint32_t n_tokens, uint32_t n_pos, const llama_pos * pos, int is_mtp) {
     return kvmem_capture_can_reuse(n_tokens, n_pos, pos, is_mtp);
+}
+
+uint64_t llama_kvmem_capture_stamp(void) {
+    const auto * memory = kvmem_current_execution().memory;
+    return memory ? memory->capture_stamp() : 0;
 }

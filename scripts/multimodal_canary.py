@@ -84,6 +84,83 @@ class RocmSampler(threading.Thread):
         }
 
 
+class WindowsNvidiaSampler(threading.Thread):
+    """Whole-device VRAM sampler via nvidia-smi. Same columns as Sampler."""
+
+    def __init__(self, gpu_index, folder):
+        super().__init__(daemon=True)
+        self.gpu_index, self.folder = gpu_index, folder
+        self.phase = 'loading'
+        self.stop_event = threading.Event()
+        self.rows = []
+        self.errors = []
+        self.error_count = 0
+        candidates = [
+            os.environ.get('NVIDIA_SMI', ''),
+            r'C:\Windows\System32\nvidia-smi.exe',
+            r'C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe',
+            'nvidia-smi',
+        ]
+        self.nvidia_smi = next((path for path in candidates if path and (path == 'nvidia-smi' or Path(path).is_file())), 'nvidia-smi')
+
+    def run(self):
+        start = time.monotonic()
+        with (self.folder / 'vram.csv').open('w') as output:
+            writer = csv.writer(output)
+            writer.writerow(['elapsed_s', 'phase', 'used_mib', 'free_mib', 'reserved_mib',
+                             'temperature_c', 'sm_clock_mhz', 'power_w'])
+            while not self.stop_event.is_set():
+                try:
+                    result = subprocess.run(
+                        [self.nvidia_smi, '-i', str(self.gpu_index),
+                         '--query-gpu=memory.used,memory.free,temperature.gpu,clocks.sm,power.draw',
+                         '--format=csv,noheader,nounits'],
+                        capture_output=True, text=True, check=True, timeout=5)
+                    parts = [part.strip() for part in result.stdout.splitlines()[0].split(',')]
+
+                    def number(text):
+                        try:
+                            return float(text)
+                        except ValueError:
+                            return None
+
+                    row = [time.monotonic() - start, self.phase, float(parts[0]), float(parts[1]), 0.0,
+                           number(parts[2]) if len(parts) > 2 else None,
+                           number(parts[3]) if len(parts) > 3 else None,
+                           number(parts[4]) if len(parts) > 4 else None]
+                    self.rows.append(row)
+                    writer.writerow(row)
+                    output.flush()
+                except (IndexError, ValueError, OSError, subprocess.SubprocessError) as exc:
+                    self.error_count += 1
+                    if len(self.errors) < 8:
+                        self.errors.append(repr(exc))
+                self.stop_event.wait(0.5)
+
+    def finish(self):
+        self.stop_event.set()
+        self.join()
+        phases = {}
+        for phase in sorted({row[1] for row in self.rows}):
+            rows = [row for row in self.rows if row[1] == phase]
+            phases[phase] = {
+                'peak_mib': max(row[2] for row in rows),
+                'last_mib': rows[-1][2],
+                'min_free_mib': min(row[3] for row in rows),
+                'samples': len(rows),
+            }
+        return {
+            'peak_vram_mib': max((row[2] for row in self.rows), default=None),
+            'phase_metrics': phases,
+            'sample_count': len(self.rows),
+            'sampling_errors': self.errors,
+            'sampling_error_count': self.error_count,
+            'max_sample_gap_ms': max(
+                (b[0] - a[0] for a, b in zip(self.rows, self.rows[1:])), default=0) * 1000
+                if len(self.rows) > 1 else None,
+        }
+
+
 def fixture(size=896, changed=False):
     rows = []
     for y in range(size):
@@ -200,6 +277,11 @@ def main():
         library_path += ':' + inherited_libraries
     env.update(LD_LIBRARY_PATH=library_path,
                NO_PROXY='127.0.0.1,localhost', no_proxy='127.0.0.1,localhost')
+    if os.name == 'nt':
+        cuda = os.environ.get('CUDA_PATH', r'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2')
+        env['PATH'] = ';'.join([
+            str(args.binary.resolve().parent), str(Path(cuda) / 'bin'), str(Path(cuda) / 'bin' / 'x64'),
+            env.get('PATH', '')])
     if gpu_api == 'rocm':
         env.pop('CUDA_VISIBLE_DEVICES', None)
         env.pop('CUDA_DEVICE_ORDER', None)
@@ -236,27 +318,61 @@ def main():
     nvml = None
     if gpu_api == 'rocm':
         sampler = RocmSampler(args.gpu_index, folder)
+    elif os.name == 'nt' and not Path(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'nvml.dll').is_file():
+        sampler = WindowsNvidiaSampler(args.gpu_index, folder)
     else:
-        nvml = ctypes.CDLL('libnvidia-ml.so.1')
+        nvml = ctypes.CDLL(str(Path(os.environ.get('WINDIR', r'C:\Windows'), 'System32', 'nvml.dll'))
+                          if os.name == 'nt' else 'libnvidia-ml.so.1')
         assert nvml.nvmlInit_v2() == 0
         device = ctypes.c_void_p()
         assert nvml.nvmlDeviceGetHandleByIndex_v2(
             ctypes.c_uint(args.gpu_index), ctypes.byref(device)) == 0
         sampler = Sampler(nvml, device, folder)
     def system_swap():
+        if os.name == 'nt':
+            return 0.0, ''
         raw = Path('/proc/meminfo').read_text()
         values = dict((k, int(v)) for k, v in re.findall(r'^(SwapTotal|SwapFree):\s+(\d+)', raw, re.M))
         return (values['SwapTotal'] - values['SwapFree']) / 1024, raw
     baseline_swap, _ = system_swap()
     swap_stop = {}
     with (folder / 'server.stderr.log').open('w') as fh:
-        proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=fh)
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.DEVNULL, stderr=fh,
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
     (folder / 'pid').write_text(str(proc.pid))
     sampler.start()
     rss_stop = threading.Event()
     rss_samples = []
     rss_phase_peaks = {}
     def sample_rss():
+        if os.name == 'nt':
+            class ProcessMemory(ctypes.Structure):
+                _fields_ = [('cb', ctypes.c_ulong), ('faults', ctypes.c_ulong)] + [
+                    (name, ctypes.c_size_t) for name in ('peak_working_set', 'working_set',
+                    'peak_paged_pool', 'paged_pool', 'peak_nonpaged_pool', 'nonpaged_pool',
+                    'pagefile', 'peak_pagefile', 'private')]
+            psapi = ctypes.WinDLL('psapi', use_last_error=True)
+            psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessMemory), ctypes.c_ulong]
+            psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+            start = time.monotonic()
+            with (folder / 'rss.csv').open('w') as output:
+                writer = csv.writer(output)
+                writer.writerow(['elapsed_s', 'phase', 'rss_mib', 'anon_mib', 'file_mib', 'swap_mib', 'private_mib'])
+                while not rss_stop.is_set():
+                    memory = ProcessMemory()
+                    memory.cb = ctypes.sizeof(memory)
+                    if not psapi.GetProcessMemoryInfo(ctypes.c_void_p(int(proc._handle)), ctypes.byref(memory), memory.cb):
+                        if proc.poll() is not None:
+                            break
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    value = memory.working_set / 2**20
+                    phase = sampler.phase
+                    rss_samples.append(value)
+                    rss_phase_peaks[phase] = max(rss_phase_peaks.get(phase, 0), value)
+                    writer.writerow([time.monotonic() - start, phase, value, None, None, None, memory.private / 2**20])
+                    output.flush()
+                    rss_stop.wait(.2)
+            return
         start = time.monotonic()
         with (folder / 'rss.csv').open('w') as output:
             writer = csv.writer(output)

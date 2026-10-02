@@ -21,8 +21,7 @@ static kvmem_session_payload & session_freeze(ServerState & st, int id) {
                 b.accounting = data.accounting.get();
                 b.account = [](void * p, int64_t delta) {
                     auto & a = *static_cast<MultimodalCheckpointAccounting *>(p);
-                    if (delta < 0) a.live_bytes -= size_t(-delta); else a.live_bytes += size_t(delta);
-                    a.peak_bytes = std::max(a.peak_bytes, a.live_bytes);
+                    if (delta < 0) a.live_bytes -= size_t(-delta); else a.add(size_t(delta));
                 };
             }
             buffers.push_back(b);

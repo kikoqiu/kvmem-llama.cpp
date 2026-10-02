@@ -9,7 +9,7 @@ mkdir -p "$out"
 includes=(-Itools -Ikvmem/include -Isrc/adapter -Illama.cpp/include -Illama.cpp/ggml/include
           -Illama.cpp/common -Illama.cpp/vendor -Illama.cpp/vendor/cpp-httplib
           -Illama.cpp/tools/server -Illama.cpp/tools/mtmd)
-for test in server-options-test server-progress-test output-limit-test; do
+for test in server-options-test server-progress-test output-limit-test lane-pool-test; do
   "${CXX:-g++}" -std=c++17 -O2 -pthread "${includes[@]}" "tests/$test.cpp" -o "$out/$test"
   "$out/$test"
 done

@@ -10,6 +10,9 @@
 #include "kvmem-server-auth.h"
 #include "kvmem-server-progress.h"
 #include "kvmem-swap-status.h"
+#include "kvmem-lane-pool.h"
+#include "kvmem-execution-scope.h"
+#include <atomic>
 #include "kvmem-server-devices.h"
 #include "kvmem-server-env.h"
 #include "kvmem-vision.h"
@@ -36,6 +39,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <ctime>
 #include <cstdlib>
@@ -60,7 +64,7 @@ static void print_usage(const char * argv0) {
     fprintf(stderr,
             "usage: %s -m model.gguf [options]\n"
             "\n"
-            "  Independent single-slot OpenAI-compatible server. Does not patch llama-server.\n"
+            "  Independent OpenAI-compatible server with up to two text lanes. Does not patch llama-server.\n"
             "  Endpoints: /v1/chat/completions, /v1/responses (streaming and non-streaming),\n"
             "             /v1/models, /props, /slots, /health, plus the bundled chat UI.\n"
             "\n"
@@ -71,6 +75,7 @@ static void print_usage(const char * argv0) {
             "  -mmdev, --mmproj-device DEVICE  select vision device, e.g. CUDA1 or Vulkan0 (none = CPU)\n"
             "  --image-min-tokens N       native minimum image token count\n"
             "  --image-max-tokens N       native maximum image token count\n"
+            "  --video-fps F              video sampling fps for video input (default 2.0; <=0 uses the video's native fps)\n"
             "  -lv, --verbosity N         log level: 0 silent, 1 error, 2 warn, 3 info (default), 4 trace, 5 debug\n"
             "  --log-verbosity N          alias of --verbosity\n"
             "  --kvmem-trace              raw KVMEM_* diagnostics (or KVMEM_TRACE=1)\n"
@@ -91,8 +96,8 @@ static void print_usage(const char * argv0) {
             "  -a, --alias NAME           model name exposed by the API\n"
             "  --api-key KEY[,KEY...]     allowed API keys\n"
             "  --api-key-file PATH        one key per line; blank/# lines ignored\n"
-            "  -np, --parallel N          only 1 is currently supported; see\n"
-            "                            --kvmem-conversations for several conversations\n"
+            "  -np, --parallel N          1..4 independent inference lanes (default: 1)\n"
+            "                            context and KV budgets are per lane\n"
             "  -lm, --load-mode MODE      auto | none | mmap | mlock | mmap+mlock | dio\n"
             "  --mmap / --no-mmap         legacy aliases for load-mode mmap / none\n"
             "  --mlock                   legacy alias for load-mode mlock\n"
@@ -210,8 +215,13 @@ static int force_pos_from_substr(const llama_vocab * vocab, const std::vector<ll
 }
 
 struct MultimodalCheckpointAccounting {
-    size_t live_bytes = 0;
-    size_t peak_bytes = 0;
+    std::atomic<size_t> live_bytes {0};
+    std::atomic<size_t> peak_bytes {0};
+    void add(size_t bytes) {
+        const size_t live = live_bytes.fetch_add(bytes) + bytes;
+        size_t peak = peak_bytes.load();
+        while (peak < live && !peak_bytes.compare_exchange_weak(peak, live)) {}
+    }
 };
 
 struct MultimodalCheckpointData {
@@ -310,6 +320,14 @@ private:
 };
 
 struct ServerState {
+    std::unique_ptr<llama_kvmem_execution_state, decltype(&llama_kvmem_execution_free)> execution{
+        llama_kvmem_execution_create(), llama_kvmem_execution_free};
+    ~ServerState() {
+        kvmem_execution_scope scope(execution.get());
+        vision.reset();
+        kvmem_spec_stop(spec);
+        if (ctx) llama_free(ctx);
+    }
     std::mutex mu;
     kvmem_server_progress progress;
     kvmem_server_log log;
@@ -331,6 +349,7 @@ struct ServerState {
     int prefill_query_max_tokens = 128;
     bool query_replay_auto = true;
     bool query_policy_user = true;
+    bool recurrent_cache_valid = true; // Positions alone do not identify a conversation.
     uint32_t turn_generation_rows = 0;
     bool turn_query_exact = false;
     std::string model_name = "kvmem";
@@ -346,7 +365,7 @@ struct ServerState {
     int reasoning_budget_default = -1;
     std::string reasoning_budget_message;
     std::vector<llama_token> cached_tokens;
-    std::unique_ptr<kvmem_vision> vision;
+    std::shared_ptr<kvmem_vision> vision;
     std::shared_ptr<kvmem_prompt> active_prompt;
     std::shared_ptr<kvmem_prompt> cached_prompt;
     std::vector<MultimodalCheckpoint> mm_checkpoints;
@@ -462,7 +481,7 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
         common_speculative_get_state(st.spec.spec, 0, carry);
         if (carry.size() >= sizeof(draft_rows)) std::memcpy(&draft_rows, carry.data(), sizeof(draft_rows));
     }
-    if (rmax == want && draft_rows == n_past) return true;
+    if (st.recurrent_cache_valid && rmax == want && draft_rows == n_past) return true;
     const std::vector<uint8_t> * saved_carry = nullptr;
     const uint8_t * blob = nullptr;
     size_t blob_n = 0;
@@ -513,7 +532,8 @@ static bool gdn_sync_to(ServerState & st, const std::vector<llama_token> & promp
     rmax = llama_kvmem_recr_pos_max();
     kvmem_diag("KVMEM_TRACE gdn_sync ckpt_pos=%d from=%d n_past=%d rmax=%d\n",
             ckpt_pos, from, n_past, (int) rmax);
-    return rmax == want;
+    st.recurrent_cache_valid = rmax == want;
+    return st.recurrent_cache_valid;
 }
 
 static int common_token_prefix(const std::vector<llama_token> & a,
@@ -577,6 +597,7 @@ static void conversation_swap(ServerState & st, kvmem_conversation & conv) {
     std::swap(st.last_query_end, conv.last_query_end);
     st.last_user_text.swap(conv.last_user_text);
     std::swap(st.last_n_gen, conv.last_n_gen);
+    st.recurrent_cache_valid = false;
 }
 
 // Accounted host bytes of one conversation: the adapter's raw K/V store plus
@@ -868,6 +889,7 @@ static void memory_clear_all(ServerState & st) {
     st.last_query_end = -1;
     st.last_user_text.clear();
     st.last_n_gen = 0;
+    st.recurrent_cache_valid = true;
     publish_swap_status(st, true, true);
     // Clears the attached conversation only: llama_memory_clear reaches the
     // host store that is bound right now, and every st.* field above is that
@@ -1172,6 +1194,7 @@ static int decode_span_maybe_spec(ServerState & st, const llama_token * toks, in
 }
 
 #include "kvmem-multimodal-server.h"
+#include "kvmem-lane-conversations.h"
 
 static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_token> & prompt,
                                  StreamIo * io = nullptr, int * n_cache_hit = nullptr) {
@@ -1221,7 +1244,7 @@ static bool run_prefill_retrieval(ServerState & st, const std::vector<llama_toke
     const bool same_query = !st.last_user_text.empty() &&
             st.last_user_text == st.turn_last_user;
     const bool gdn_at_tip = !llama_kvmem_has_recurrent() ||
-            (n_past > 0 && gdn_rmax == (llama_pos) (n_past - 1));
+            (st.recurrent_cache_valid && n_past > 0 && gdn_rmax == (llama_pos) (n_past - 1));
     const bool kv_at_tip = n_past > 0 && kv_smax >= (llama_pos) (n_past - 1);
     // Same last-user: keep the GPU window and only prefill the new tail.
     // Suffix after query is recency (recent_tokens), not skip-gated.
@@ -2434,14 +2457,18 @@ int main(int argc, char ** argv) {
     json template_defaults = json::object();
     bool mmproj_gpu = true;
     int image_min_tokens = -1, image_max_tokens = -1;
+    float video_fps = 2.0f;
     std::string host = "127.0.0.1";
     std::string nvme_dir;
     int port = 8080;
     int n_ctx = 2048;
     int ngl = 99;
     kvmem_server_devices device_config;
+    std::unique_ptr<llama_model, decltype(&llama_model_free)> shared_model(nullptr, llama_model_free);
     ServerState st;
+    kvmem_execution_scope startup_execution(st.execution.get());
     kvmem_server_options options;
+    int requested_conversations = 1;
     st.kparams.mtp_state = 2; // ReplaySSM by default when MTP is enabled.
     st.kparams.block_tokens = 128;
     st.kparams.gen_reserve = 256;
@@ -2508,6 +2535,17 @@ int main(int argc, char ** argv) {
                 (eq(arg, "--image-min-tokens") ? image_min_tokens : image_max_tokens) = n;
             } catch (...) {
                 fprintf(stderr, "%s requires a positive integer\n", arg);
+                return 1;
+            }
+        } else if (eq(arg, "--video-fps")) {
+            const std::string value = need(arg);
+            try {
+                size_t used = 0;
+                const float f = std::stof(value, &used);
+                if (used != value.size() || !std::isfinite(f)) throw std::invalid_argument("finite number required");
+                video_fps = f;
+            } catch (...) {
+                fprintf(stderr, "%s requires a finite number (<=0 uses the video's native fps)\n", arg);
                 return 1;
             }
         } else if (eq(arg, "--ui-dir")) {
@@ -2715,6 +2753,8 @@ int main(int argc, char ** argv) {
             return 1;
         }
     }
+    requested_conversations = options.conversations;
+    options.conversations = std::max(options.conversations, options.parallel);
     st.kparams.sink_tokens = static_cast<uint32_t>(options.sink_tokens);
     st.swap_ui = options.swap_ui;
     st.protect_system = options.protect_system;
@@ -2854,6 +2894,21 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "KVMEM_STARTUP_ERROR multi-GPU MTP requires --kvmem and explicit --kvmem-mtp-state snapshots|replay (auto is not supported yet)\n");
         return 1;
     }
+    if (requested_conversations != options.conversations) {
+        LOG_INF("srv    KVMEM conversations adjusted requested=%d effective=%d parallel=%d\n",
+                requested_conversations, options.conversations, options.parallel);
+    }
+    if (options.parallel > 1 && (!st.kparams.enabled ||
+            options.device_names == "none" || mparams.n_gpu_layers == 0 ||
+            options.session_disk_bytes ||
+            st.kparams.nvme_bytes || st.kparams.raw_k_nvme ||
+            device_config.devices.size() > 2 || mparams.split_mode == LLAMA_SPLIT_MODE_TENSOR ||
+            (options.threads_http > 0 && options.threads_http < 2 * options.parallel))) {
+        fprintf(stderr, "KVMEM_STARTUP_ERROR --parallel %d requires KVMem, one target GPU, "
+                "no NVMe/session disk cache, and at least %d HTTP workers\n",
+                options.parallel, 2 * options.parallel);
+        return 1;
+    }
     // Check resources before spending time/VRAM on loading model weights.
     auto readable = [](const std::string & path) {
         std::error_code ec;
@@ -2885,14 +2940,16 @@ int main(int argc, char ** argv) {
                    {"sink_tokens", st.kparams.sink_tokens}, {"block_tokens", st.kparams.block_tokens}}},
         {"spec_type", st.spec_mtp ? "draft-mtp" : "none"},
         {"vision", {{"enabled", !mmproj_path.empty()}, {"projector", mmproj_path}, {"gpu", mmproj_gpu},
-                    {"device", mmproj_gpu ? (mmproj_device_name.empty() ? "auto" : mmproj_device_name) : "CPU"}}},
-        {"http", {{"host", host}, {"port", port}, {"timeout", options.timeout}, {"slots", 1}}},
+                    {"device", mmproj_gpu ? (mmproj_device_name.empty() ? "auto" : mmproj_device_name) : "CPU"},
+                    {"video_fps", video_fps}}},
+        {"http", {{"host", host}, {"port", port}, {"timeout", options.timeout}, {"slots", options.parallel}}},
         {"auth", {{"enabled", !options.api_keys.empty()}, {"key_count", options.api_keys.size()}}},
         {"sources", config_sources}, {"unlisted_sources", "default"}
     };
     kvmem_diag("KVMEM_STARTUP requested=%s\n", startup.dump(-1, ' ', false, json::error_handler_t::replace).c_str());
     LOG_INF("srv    loading model %s\n", model_path.c_str());
-    st.model = llama_model_load_from_file(model_path.c_str(), mparams);
+    shared_model.reset(llama_model_load_from_file(model_path.c_str(), mparams));
+    st.model = shared_model.get();
     if (!st.model) {
         fprintf(stderr, "failed to load model\n");
         return 1;
@@ -2922,41 +2979,81 @@ int main(int argc, char ** argv) {
         cparams.n_outputs_max_per_seq = n_out;
         cparams.n_rs_seq = (uint32_t) std::max(0, st.spec_n_max);
     }
-    st.ctx = llama_init_from_model(st.model, cparams);
-    if (!st.ctx) {
-        fprintf(stderr, "KVMEM_STARTUP_ERROR failed to create context; check --ctx-size, KV types, --flash-attn and available memory\n");
-        return 1;
-    }
-    kvmem_diag("KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
-            llama_n_threads(st.ctx), llama_n_threads_batch(st.ctx), llama_n_ubatch(st.ctx),
-            llama_flash_attn_type_name(cparams.flash_attn_type));
-    if (st.spec_mtp) {
-        kvmem_spec_opts sopts;
-        sopts.n_max = st.spec_n_max;
-        sopts.p_min = st.spec_p_min;
-        sopts.n_gpu_layers = ngl;
-        sopts.n_ctx = n_ctx;
-        sopts.n_batch = st.n_batch;
-        sopts.n_ubatch = cparams.n_ubatch;
-        sopts.n_threads = options.threads;
-        sopts.n_threads_batch = options.threads_batch > 0 ? options.threads_batch : options.threads;
-        if (options.flash_attn_set) sopts.flash_attn = options.flash_attn;
-        sopts.kvmem_enabled = st.kparams.enabled;
-        sopts.type_k = st.cache_type_k;
-        sopts.type_v = st.cache_type_v;
-        sopts.draft_type = st.spec_cache_type;
-        if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
-            return 1;
+    auto initialize_lane = [&](ServerState & st) {
+        kvmem_execution_scope scope(st.execution.get());
+        llama_kvmem_set_params(&st.kparams);
+        st.ctx = llama_init_from_model(st.model, cparams);
+        if (!st.ctx) {
+            fprintf(stderr, "KVMEM_STARTUP_ERROR failed to create context; check --ctx-size, KV types, --flash-attn and available memory\n");
+            return false;
         }
+        kvmem_diag("KVMEM_CONTEXT target threads=%d threads_batch=%d ubatch=%u flash_attn_requested=%s\n",
+                llama_n_threads(st.ctx), llama_n_threads_batch(st.ctx), llama_n_ubatch(st.ctx),
+                llama_flash_attn_type_name(cparams.flash_attn_type));
+        if (st.spec_mtp) {
+            kvmem_spec_opts sopts;
+            sopts.n_max = st.spec_n_max;
+            sopts.p_min = st.spec_p_min;
+            sopts.n_gpu_layers = ngl;
+            sopts.n_ctx = n_ctx;
+            sopts.n_batch = st.n_batch;
+            sopts.n_ubatch = cparams.n_ubatch;
+            sopts.n_threads = options.threads;
+            sopts.n_threads_batch = options.threads_batch > 0 ? options.threads_batch : options.threads;
+            if (options.flash_attn_set) sopts.flash_attn = options.flash_attn;
+            sopts.kvmem_enabled = st.kparams.enabled;
+            sopts.type_k = st.cache_type_k;
+            sopts.type_v = st.cache_type_v;
+            sopts.draft_type = st.spec_cache_type;
+            if (!kvmem_spec_start(st.spec, st.model, st.ctx, sopts)) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+    if (!initialize_lane(st)) return 1;
+    std::vector<std::unique_ptr<ServerState>> additional_lanes;
+    std::vector<ServerState *> lanes{&st};
+    for (int lane = 1; lane < options.parallel; ++lane) {
+        auto next = std::make_unique<ServerState>();
+        next->model = st.model;
+        next->vocab = st.vocab;
+        next->kparams = st.kparams;
+        next->n_batch = st.n_batch;
+        next->n_predict_default = st.n_predict_default;
+        next->sampling_overrides = st.sampling_overrides;
+        next->query_last_fallback = st.query_last_fallback;
+        next->query_max_tokens = st.query_max_tokens;
+        next->query_replay_auto = st.query_replay_auto;
+        next->query_policy_user = st.query_policy_user;
+        next->model_name = st.model_name;
+        next->cache_type_k = st.cache_type_k;
+        next->cache_type_v = st.cache_type_v;
+        next->spec_cache_type = st.spec_cache_type;
+        next->spec_mtp = st.spec_mtp;
+        next->spec_n_max = st.spec_n_max;
+        next->spec_p_min = st.spec_p_min;
+        next->enable_thinking_default = st.enable_thinking_default;
+        next->template_kwargs = st.template_kwargs;
+        next->reasoning_budget_default = st.reasoning_budget_default;
+        next->reasoning_budget_message = st.reasoning_budget_message;
+        next->tmpls = common_chat_templates_init(st.model, chat_template);
+        if (!initialize_lane(*next)) return 1;
+        lanes.push_back(next.get());
+        additional_lanes.push_back(std::move(next));
     }
+    kvmem_lane_pool lane_pool(lanes.size());
+    LOG_INF("srv    KVMEM lanes=%zu shared_model=1 context_per_lane=%d budget_per_lane=%u "
+            "generation_reserve_per_lane=%u\n", lanes.size(), n_ctx, st.kparams.budget, st.kparams.gen_reserve);
 
     if (!mmproj_path.empty()) {
         try {
             if (image_min_tokens > 0 && image_max_tokens > 0 && image_min_tokens > image_max_tokens)
                 throw std::invalid_argument("image-min-tokens exceeds image-max-tokens");
-            st.vision = std::make_unique<kvmem_vision>(
+            st.vision = std::make_shared<kvmem_vision>(
                     st.model, mmproj_path, mmproj_gpu, mmproj_device,
-                    image_min_tokens, image_max_tokens, options.threads);
+                    image_min_tokens, image_max_tokens, options.threads, video_fps);
         } catch (const std::exception & e) {
             fprintf(stderr, "%s\n", e.what());
             return 1;
@@ -2966,7 +3063,7 @@ int main(int argc, char ** argv) {
     // Arm the multi-conversation host stores only now: the adapter refuses the
     // swap in configurations it cannot drain back from host RAM, and flash
     // attention is resolved inside llama_init_from_model, not at parse time.
-    if (options.conversations > 1) {
+    if (options.parallel == 1 && options.conversations > 1) {
         if (!llama_kvmem_store_swap_supported()) {
             if (options.session_disk_bytes) {
                 LOG_ERR("srv    KVMEM session disk cache requires supported session switching (flash attention on)\n");
@@ -3015,17 +3112,41 @@ int main(int argc, char ** argv) {
         }
     }
 
+    std::unique_ptr<kvmem_lane_conversations> lane_conversations;
+    if (options.parallel > 1) {
+        for (auto * lane : lanes) {
+            kvmem_execution_scope execution(lane->execution.get());
+            if (!llama_kvmem_store_swap_supported()) {
+                LOG_ERR("srv    KVMEM multiple lanes require supported host KV switching (flash attention on)\n");
+                return 1;
+            }
+            if (!llama_kvmem_store_compatible_with_execution(lanes[0]->execution.get())) {
+                LOG_ERR("srv    KVMEM lanes need identical KV geometry; set an explicit --kvmem-budget\n");
+                return 1;
+            }
+            lane->vision = st.vision;
+        }
+        lane_conversations = std::make_unique<kvmem_lane_conversations>(lanes, options.conversations, options.conversation_bytes);
+        LOG_INF("srv    KVMEM global conversations=%d lanes=%d cpu_budget_per_store=%llu\n",
+                options.conversations, options.parallel, (unsigned long long)st.kparams.cpu_bytes);
+    }
+    auto preparation_templates = common_chat_templates_init(st.model, chat_template);
+    std::mutex preparation_templates_mutex;
     httplib::Server svr;
     // One snapshot before serving, so /kvmem/swap/status can tell "KVMem is off"
     // (no GPU pool) from "on, nothing cached yet".
     publish_swap_status(st, true, true);
     svr.set_read_timeout(options.timeout, 0);
     svr.set_write_timeout(options.timeout, 0);
-    if (options.threads_http_set) {
-        const int n = options.threads_http > 0 ? options.threads_http :
-            std::max(5, static_cast<int>(std::thread::hardware_concurrency()) - 1);
-        svr.new_task_queue = [n] { return new httplib::ThreadPool(n, static_cast<size_t>(n) + 1024); };
-        kvmem_diag("KVMEM_HTTP threads=%d timeout=%d\n", n, options.timeout);
+    const int http_workers = options.threads_http_set ?
+        (options.threads_http > 0 ? options.threads_http :
+            std::max(2 * options.parallel, std::max(5, static_cast<int>(std::thread::hardware_concurrency()) - 1))) :
+        std::max(2 * options.parallel, static_cast<int>(CPPHTTPLIB_THREAD_POOL_COUNT));
+    if (options.threads_http_set || options.parallel > 1) {
+        svr.new_task_queue = [http_workers] {
+            return new httplib::ThreadPool(http_workers, static_cast<size_t>(http_workers) + 1024);
+        };
+        kvmem_diag("KVMEM_HTTP threads=%d timeout=%d\n", http_workers, options.timeout);
     }
     svr.set_idle_interval(0, 100000);
     svr.set_default_headers({
@@ -3071,9 +3192,7 @@ int main(int argc, char ** argv) {
     startup["flash_attn_requested"] = llama_flash_attn_type_name(cparams.flash_attn_type);
     startup["generation_limit"] = generation_limit;
     startup["default_max_tokens"] = default_max_tokens;
-    startup["http"]["threads"] = options.threads_http_set ?
-        (options.threads_http > 0 ? options.threads_http : std::max(5, static_cast<int>(std::thread::hardware_concurrency()) - 1)) :
-        static_cast<int>(CPPHTTPLIB_THREAD_POOL_COUNT);
+    startup["http"]["threads"] = http_workers;
     if (!config_sources.contains("--threads-batch") && options.threads > 0)
         startup["sources"]["--threads-batch"] = "inherited:--threads";
     if (!config_sources.contains("--ubatch-size")) startup["sources"]["--ubatch-size"] = "inherited:--batch-size";
@@ -3103,13 +3222,14 @@ int main(int argc, char ** argv) {
         // upstream get_res_props fields
         // 中文：上游 /props 返回的标准字段，UI 依赖这些键渲染模型信息
         {"default_generation_settings", {{"params", default_params}, {"n_ctx", n_ctx}}},
-        {"total_slots", 1},
+        {"total_slots", options.parallel},
         {"model_alias", st.model_name},
         // kvmem's llama.cpp predates llama_model_ftype_name(); keep the field for UI parity.
         // 中文：当前 kvmem 的 llama.cpp 尚无 llama_model_ftype_name()，保留空字段以兼容上游 UI 展示
         {"model_ftype", ""},
         {"model_path", model_path},
-        {"modalities", {{"vision", st.vision != nullptr}, {"audio", false}, {"video", false}}},
+        {"modalities", {{"vision", st.vision != nullptr}, {"audio", false},
+                        {"video", st.vision && options.parallel == 1 && st.vision->supports_video()}}},
         {"media_marker", mtmd_default_marker()},
         {"endpoint_slots", true}, {"endpoint_props", false}, {"endpoint_metrics", false},
         {"ui", !no_ui},
@@ -3129,8 +3249,13 @@ int main(int argc, char ** argv) {
                           {"reasoning_budget_tokens", st.reasoning_budget_default}, {"chat_template_kwargs", kwargs}}},
             {"sampling", {{"thinking", thinking_params}, {"non_thinking", plain_params}}}}}
     };
-    // Capability probe, present only when the feature is on, so /props is
-    // byte-identical without the flag.
+    props["kvmem"]["vision"] = startup["vision"];
+    props["kvmem"]["parallel"] = options.parallel;
+    props["kvmem"]["conversations_requested"] = requested_conversations;
+    if (options.parallel > 1) props["kvmem"]["conversations"] = options.conversations;
+    props["kvmem"]["conversation_cpu_bytes"] = st.kparams.cpu_bytes;
+    props["kvmem"]["conversation_bytes_max"] = options.conversation_bytes;
+    // The legacy single-lane capability can degrade to one store.
     if (st.conv_limits.max_stores > 1) {
         props["kvmem"]["conversations"] = st.conv_limits.max_stores;
     }
@@ -3144,53 +3269,60 @@ int main(int argc, char ** argv) {
     // A short-lived status lock keeps polling independent of inference.
     svr.Get("/slots", [&](const httplib::Request & req, httplib::Response & res) {
         res.set_header("Cache-Control", "no-store");
-        const auto progress = st.progress.snapshot();
-        const bool busy = progress.busy;
-        json slot = {
-            {"id", 0},
-            {"n_ctx", n_ctx},
-            {"speculative", st.spec.ok},
-            {"is_processing", busy},
-            {"id_task", progress.task},
-            {"n_prompt_tokens", progress.prompt},
-            {"n_prompt_tokens_processed", progress.processed},
-            {"n_prompt_tokens_cache", progress.cached},
-            {"params", progress.params.empty() ? default_params : progress.params},
-            {"next_token", json::array({
-                {
-                    {"has_next_token", busy},
-                    {"has_new_line", false},
-                    {"n_remain", busy ? std::max(0, progress.limit - progress.generated) : 0},
-                    {"n_decoded", progress.generated},
-                }
-            })},
-            {"prompt", ""},
-            {"generated", ""},
-        };
-        // N host stores do not make the server concurrent: total_slots stays 1
-        // and there is still exactly one inference slot.
-        if (st.conv_limits.max_stores > 1) {
-            const auto conv = st.conv_stats.snapshot();
-            slot["kvmem"] = {{"conversations", {
-                {"count", conv.count},
-                {"max", conv.max},
-                {"active", conv.active},
-                {"bytes", conv.bytes},
-                {"bytes_max", conv.bytes_max},
-                {"extends", conv.extends},
-                {"forks", conv.forks},
-                {"refusals", conv.refusals},
-                {"resets", conv.resets},
-                {"evictions", conv.evictions},
-                {"switches", conv.switches}}}};
-            auto & sessions = slot["kvmem"]["conversations"];
-            sessions["disk_bytes"] = conv.disk_bytes;
-            sessions["disk_bytes_max"] = conv.disk_bytes_max;
-            sessions["spills"] = conv.spills;
-            sessions["restores"] = conv.restores;
-            sessions["disk_errors"] = conv.disk_errors;
+        json slots = json::array();
+        bool all_busy = true;
+        for (size_t lane = 0; lane < lanes.size(); ++lane) {
+            const auto & st = *lanes[lane];
+            const auto progress = st.progress.snapshot();
+            const bool busy = progress.busy;
+            json slot = {
+                {"id", lane},
+                {"n_ctx", n_ctx},
+                {"speculative", st.spec.ok},
+                {"is_processing", busy},
+                {"id_task", progress.task},
+                {"n_prompt_tokens", progress.prompt},
+                {"n_prompt_tokens_processed", progress.processed},
+                {"n_prompt_tokens_cache", progress.cached},
+                {"params", progress.params.empty() ? default_params : progress.params},
+                {"next_token", json::array({
+                    {
+                        {"has_next_token", busy},
+                        {"has_new_line", false},
+                        {"n_remain", busy ? std::max(0, progress.limit - progress.generated) : 0},
+                        {"n_decoded", progress.generated},
+                    }
+                })},
+                {"prompt", ""},
+                {"generated", ""},
+            };
+            // Conversation counters belong to this lane.
+            if (st.conv_limits.max_stores > 1) {
+                const auto conv = st.conv_stats.snapshot();
+                slot["kvmem"] = {{"conversations", {
+                    {"count", conv.count},
+                    {"max", conv.max},
+                    {"active", conv.active},
+                    {"bytes", conv.bytes},
+                    {"bytes_max", conv.bytes_max},
+                    {"extends", conv.extends},
+                    {"forks", conv.forks},
+                    {"refusals", conv.refusals},
+                    {"resets", conv.resets},
+                    {"evictions", conv.evictions},
+                    {"switches", conv.switches}}}};
+                auto & sessions = slot["kvmem"]["conversations"];
+                sessions["disk_bytes"] = conv.disk_bytes;
+                sessions["disk_bytes_max"] = conv.disk_bytes_max;
+                sessions["spills"] = conv.spills;
+                sessions["restores"] = conv.restores;
+                sessions["disk_errors"] = conv.disk_errors;
+            }
+            if (lane_conversations) slot["kvmem"]["conversations"] = lane_conversations->status((int)lane);
+            all_busy = all_busy && busy;
+            slots.push_back(std::move(slot));
         }
-        if (busy && req.has_param("fail_on_no_slot")) {
+        if (all_busy && req.has_param("fail_on_no_slot")) {
             res.status = 503;
             res.set_content(json{{"error", json{
                 {"code", 503},
@@ -3199,7 +3331,7 @@ int main(int argc, char ** argv) {
             }}}.dump(), "application/json");
             return;
         }
-        res.set_content(json::array({slot}).dump(), "application/json");
+        res.set_content(slots.dump(), "application/json");
     });
     // Swap-status page (--kvmem-swap-ui). The model thread publishes snapshots
     // and these handlers only read them, so polling never waits for inference.
@@ -3246,7 +3378,17 @@ int main(int argc, char ** argv) {
     svr.Get("/v1/models", [&](const httplib::Request &, httplib::Response & res) {
         json j = {
             {"object", "list"},
-            {"data", json::array({json{{"id", st.model_name}, {"name", st.model_name}, {"object", "model"}, {"status", {{"value", "loaded"}}}}})},
+            {"data", json::array({json{
+                {"id", st.model_name},
+                {"name", st.model_name},
+                {"object", "model"},
+                {"status", {{"value", "loaded"}}},
+                {"meta", {
+                    {"n_ctx", llama_n_ctx(st.ctx)},
+                    {"n_ctx_train", llama_model_n_ctx_train(st.model)},
+                    {"n_embd", llama_model_n_embd(st.model)},
+                }},
+            }})},
         };
         res.set_content(j.dump(), "application/json");
     });
@@ -3258,7 +3400,7 @@ int main(int argc, char ** argv) {
     // to tell which item shape it uses. Every request gets its own numbered pair,
     // so a multi-turn exchange (tool call, then the tool result sent back) reads
     // in order. Unset KVMEM_DBG_DIR = no-op, which is the normal case.
-    const auto kvmem_debug_dump = [seq = std::make_shared<int>(0)](
+    const auto kvmem_debug_dump = [seq = std::make_shared<std::atomic<int>>(0)](
             const char * name, const std::string & data) {
         const char * dir = std::getenv("KVMEM_DBG_DIR");
         if (dir == nullptr || *dir == '\0') {
@@ -3294,7 +3436,8 @@ int main(int argc, char ** argv) {
         }        json body;
         std::vector<std::vector<uint8_t>> media_files;
         try {
-            body = json::parse(kvmem_parse_media_messages(body_text, st.vision != nullptr, media_files));
+            body = json::parse(kvmem_parse_media_messages(body_text, st.vision != nullptr,
+                                                        st.vision && options.parallel == 1 && st.vision->supports_video(), media_files));
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
@@ -3329,9 +3472,10 @@ int main(int argc, char ** argv) {
             return;
         }
 
-        auto slot = std::make_shared<kvmem_server_slot_guard>(st.mu, st.progress);
-        if (req.is_connection_closed && req.is_connection_closed()) return;
-        st.mm_reset_requested = body.value("cache_reset", false);
+        const auto cancelled = [&req] { return req.is_connection_closed && req.is_connection_closed(); };
+        auto ticket = lane_pool.enqueue(cr.conversation_id);
+        auto cache_reference = lane_conversations ? lane_conversations->pin(cr.conversation_id) : nullptr;
+        if (!lane_pool.wait_turn(ticket, cancelled)) return;
 
         common_chat_templates_inputs inputs;
         inputs.messages = cr.msgs;
@@ -3349,13 +3493,14 @@ int main(int argc, char ** argv) {
         if (cr.parallel_tool_calls_set) {
             inputs.parallel_tool_calls = cr.parallel_tool_calls;
         } else {
-            const auto caps = common_chat_templates_get_caps(st.tmpls.get());
+            const auto caps = common_chat_templates_get_caps(preparation_templates.get());
             const auto it = caps.find("supports_parallel_tool_calls");
             inputs.parallel_tool_calls = it != caps.end() && it->second;
         }
         common_chat_params formatted;
         try {
-            formatted = common_chat_templates_apply(st.tmpls.get(), inputs);
+            std::lock_guard<std::mutex> preparation(preparation_templates_mutex);
+            formatted = common_chat_templates_apply(preparation_templates.get(), inputs);
         } catch (const std::exception & e) {
             res.status = 400;
             res.set_content(json{{"error", std::string("chat template: ") + e.what()}}.dump(), "application/json");
@@ -3372,7 +3517,6 @@ int main(int argc, char ** argv) {
             res.set_content(json{{"error", e.what()}}.dump(), "application/json");
             return;
         }
-        st.active_prompt = parsed_prompt;
         auto toks = parsed_prompt->tokens;
         if (toks.empty()) {
             res.status = 400;
@@ -3393,34 +3537,6 @@ int main(int argc, char ** argv) {
             LOG_WRN("slot   max_tokens %d with %d prompt tokens exceeds n_ctx %d; using %d\n",
                     cr.max_tokens, (int) toks.size(), n_ctx_now, fit);
             cr.max_tokens = fit;
-        }
-        st.turn_generation_rows = (uint32_t) std::min<uint64_t>(UINT32_MAX,
-                (uint64_t) std::max(0, cr.max_tokens) + (st.spec.ok ? std::max(0, st.spec_n_max) + 1u : 0u));
-
-        int qbegin = cr.query_begin;
-        int qend = cr.query_end;
-        st.turn_query_exact = false;
-        st.turn_last_user = cr.last_user;
-        if (qbegin < 0 || qend < 0) {
-            derive_query_span(st, prompt, cr.last_user, toks, qbegin, qend);
-        }
-        if (st.query_policy_user) {
-            st.turn_query_exact = cr.query_begin >= 0 && cr.query_end > cr.query_begin && cr.query_end <= (int) toks.size();
-            if (cr.query_begin < 0 && cr.query_end < 0) {
-                st.turn_query_exact = derive_native_query_span(st, prompt, inputs, *parsed_prompt, qbegin, qend);
-            }
-        }
-        if (parsed_prompt->has_media() && cr.query_begin < 0 && !st.turn_query_exact) {
-            // The final text question follows native visual chunks and their boundaries.
-            int last_media_end = 0;
-            for (const auto & range : parsed_prompt->media_ranges()) last_media_end = range.second;
-            qend = (int) toks.size() - (st.spec.ok ? 1 : 0);
-            qbegin = std::max(last_media_end, qend - st.query_max_tokens);
-        }
-        clamp_query_span(st, qbegin, qend);
-        if (st.turn_query_exact && std::find(toks.begin() + qbegin, toks.begin() + qend, LLAMA_TOKEN_NULL) != toks.begin() + qend) {
-            st.turn_query_exact = false;
-            kvmem_diag("KVMEM_TRACE query_loc fallback=explicit_span_contains_media\n");
         }
         try {
             multimodal_validate_capacity(st, *parsed_prompt, (int) toks.size());
@@ -3457,29 +3573,93 @@ int main(int argc, char ** argv) {
             res.set_content("{\"error\":\"MTP sampler could not initialize for this request\"}", "application/json");
             return;
         }
-        // Map this request onto a conversation and attach its host store.
-        // Every validation of this handler answers above this line, the MTP
-        // sampler probe last, so a request rejected for its shape never parks
-        // a conversation, creates a store or evicts an LRU victim. What can
-        // still answer 400 below is a prefill failure (st.mm_error_status),
-        // and that one happens inside this conversation's own prefill: the
-        // store it names is the one the request was mapped to, so there is no
-        // switch to undo. Still above every llama_kvmem_* call of the request,
-        // in particular llama_kvmem_set_request_span below and the checkpoint
-        // selection in run_prefill_multimodal. Nothing between the query-span
-        // derivation and here reads a field conversation_swap() exchanges.
-        // No-op with one host store.
-        st.turn_conversation_id = cr.conversation_id;
+        if (!use_spec) {
+            try {
+                common_sampler_ptr probe(common_sampler_init(st.model, sparams));
+                if (!probe) throw std::runtime_error("sampler initialization failed");
+            } catch (const std::exception & e) {
+                res.status = 400;
+                res.set_content(json{{"error", e.what()}}.dump(), "application/json"); return;
+            }
+        }
+        auto operation = std::make_shared<kvmem_lane_conversations::operation>();
+        size_t prepare_begin = lane_conversations
+            ? lane_conversations->preview(*parsed_prompt, cr.conversation_id, body.value("cache_reset", false), cache_reference) : 0;
+        std::shared_ptr<kvmem_lane_pool::lease> lease;
         try {
-            if (st.session_files) session_begin_request(st, *parsed_prompt, cr.conversation_id, cr.max_tokens);
-            else conversation_begin_request(st, *parsed_prompt, cr.conversation_id);
-        } catch (const std::invalid_argument & e) {
+            for (;;) {
+                if (st.vision && parsed_prompt->has_media()) st.vision->prepare(*parsed_prompt, prepare_begin, cancelled);
+                lease = lane_pool.acquire(ticket, cancelled, [&](const std::vector<bool> & busy, bool reserve) {
+                    if (lane_conversations) return lane_conversations->select(*parsed_prompt, cr.conversation_id,
+                            body.value("cache_reset", false), busy, reserve, *operation);
+                    for (size_t lane = 0; lane < busy.size(); ++lane) if (!busy[lane]) return (int)lane;
+                    return -1;
+                });
+                if (lease || cancelled()) break;
+                prepare_begin = operation->prepare_begin;
+            }
+        } catch (const std::exception & e) {
+            if (cancelled()) return;
             res.status = 400;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json"); return;
+        }
+        if (!lease) return;
+        ServerState & st = *lanes[lease->index];
+        std::shared_ptr<kvmem_server_slot_guard> slot;
+        try {
+            slot = std::make_shared<kvmem_server_slot_guard>(st.mu, st.progress, [lease, operation, &st, &lane_conversations] {
+                kvmem_execution_scope execution(st.execution.get());
+                if (lane_conversations) lane_conversations->finish(*operation, st);
+                else {
+                    multimodal_finish_request(st);
+                    if (st.active_prompt) st.active_prompt->release_media();
+                }
+                lease->release();
+            });
+        } catch (...) {
+            if (lane_conversations) lane_conversations->finish(*operation, st);
+            throw;
+        }
+        kvmem_execution_scope execution(st.execution.get());
+        res.set_header("X-KVMem-Lane", std::to_string(lease->index));
+        if (cancelled()) return;
+        st.mm_reset_requested = body.value("cache_reset", false);
+        st.turn_conversation_id = cr.conversation_id;
+        try {
+            if (lane_conversations) lane_conversations->attach(*operation, st, cr.conversation_id);
+            else if (st.session_files) session_begin_request(st, *parsed_prompt, cr.conversation_id, cr.max_tokens);
+            else conversation_begin_request(st, *parsed_prompt, cr.conversation_id);
         } catch (const std::exception & e) {
-            conversation_publish(st);
             res.status = 503;
             res.set_content(json{{"error", e.what()}}.dump(), "application/json"); return;
+        }
+        st.active_prompt = parsed_prompt;
+        st.turn_generation_rows = (uint32_t) std::min<uint64_t>(UINT32_MAX,
+                (uint64_t) std::max(0, cr.max_tokens) + (st.spec.ok ? std::max(0, st.spec_n_max) + 1u : 0u));
+        int qbegin = cr.query_begin;
+        int qend = cr.query_end;
+        st.turn_query_exact = false;
+        st.turn_last_user = cr.last_user;
+        if (qbegin < 0 || qend < 0) {
+            derive_query_span(st, prompt, cr.last_user, toks, qbegin, qend);
+        }
+        if (st.query_policy_user) {
+            st.turn_query_exact = cr.query_begin >= 0 && cr.query_end > cr.query_begin && cr.query_end <= (int) toks.size();
+            if (cr.query_begin < 0 && cr.query_end < 0) {
+                st.turn_query_exact = derive_native_query_span(st, prompt, inputs, *parsed_prompt, qbegin, qend);
+            }
+        }
+        if (parsed_prompt->has_media() && cr.query_begin < 0 && !st.turn_query_exact) {
+            // The final text question follows native visual chunks and their boundaries.
+            int last_media_end = 0;
+            for (const auto & range : parsed_prompt->media_ranges()) last_media_end = range.second;
+            qend = (int) toks.size() - (st.spec.ok ? 1 : 0);
+            qbegin = std::max(last_media_end, qend - st.query_max_tokens);
+        }
+        clamp_query_span(st, qbegin, qend);
+        if (st.turn_query_exact && std::find(toks.begin() + qbegin, toks.begin() + qend, LLAMA_TOKEN_NULL) != toks.begin() + qend) {
+            st.turn_query_exact = false;
+            kvmem_diag("KVMEM_TRACE query_loc fallback=explicit_span_contains_media\n");
         }
 
         const int force = force_pos_from_substr(st.vocab, toks, cr.force_substr);
@@ -3694,6 +3874,7 @@ int main(int argc, char ** argv) {
             res.set_chunked_content_provider("text/event-stream",
                 [slot, &st, &req, toks, cid, request_id, created, max_tokens, sparams, parse_tools, formatted, stops,
                  spec_stream, ctx, vocab, make_emit_gen_wall, timings, is_responses](size_t, httplib::DataSink & sink) mutable {
+                    kvmem_execution_scope execution(st.execution.get());
                     StreamIo io;
                     io.sink = &sink;
                     io.req = &req;
@@ -4099,9 +4280,5 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "listen failed\n");
         return 1;
     }
-    st.vision.reset();
-    kvmem_spec_stop(st.spec);
-    llama_free(st.ctx);
-    llama_model_free(st.model);
     return 0;
 }

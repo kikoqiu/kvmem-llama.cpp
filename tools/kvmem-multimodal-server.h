@@ -53,8 +53,7 @@ static MultimodalCheckpoint multimodal_checkpoint(ServerState & st, int row) {
         }
     }
     data->accounting = st.mm_checkpoint_accounting;
-    data->accounting->live_bytes += data->bytes();
-    data->accounting->peak_bytes = std::max(data->accounting->peak_bytes, data->accounting->live_bytes);
+    data->accounting->add(data->bytes());
     result.data = std::move(data);
     st.mm_live_checkpoint = result.data;
     return result;
@@ -106,6 +105,7 @@ static void multimodal_restore(ServerState & st, const MultimodalCheckpoint & ch
     }
     st.mm_live_row = checkpoint.row;
     st.mm_live_checkpoint = checkpoint.data;
+    st.recurrent_cache_valid = true;
 }
 
 static void multimodal_finish_request(ServerState & st) {
@@ -122,11 +122,23 @@ static void multimodal_finish_request(ServerState & st) {
         multimodal_remember(st, *st.mm_rollback);
         kvmem_diag("KVMEM_TRACE multimodal_rollback context=%p row=%d\n", (void *) st.ctx, st.mm_live_row);
         kvmem_diag("KVMEM_CHECKPOINT_ROLLBACK live_bytes=%zu peak_bytes=%zu\n",
-                st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
+                st.mm_checkpoint_accounting->live_bytes.load(), st.mm_checkpoint_accounting->peak_bytes.load());
         st.mm_committed = true;
     } catch (const std::exception & e) {
         st.mm_error = e.what();
         LOG_ERR("srv    KVMEM_TRACE multimodal_rollback_failed error=%s\n", e.what());
+        // A failed recurrent restore cannot remain a reusable prefix.
+        try { memory_clear_all(st); }
+        catch (const std::exception & clear_error) {
+            LOG_ERR("srv    KVMEM cache clear failed: %s\n", clear_error.what());
+            st.cached_tokens.clear();
+            st.cached_prompt.reset();
+            st.mm_checkpoints.clear();
+            st.mm_live_checkpoint.reset();
+            st.mm_live_row = 0;
+            st.gdn_ckpt_pos = st.gdn_ckpt_query_pos = -1;
+        }
+        st.mm_committed = true;
     }
     st.mm_rollback.reset();
     st.mm_rollback_prompt.reset();
@@ -221,7 +233,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
     const auto started = std::chrono::steady_clock::now();
     st.mm_perf = {};
     const auto copies_before = llama_kvmem_get_transfer_stats();
-    st.mm_checkpoint_accounting->peak_bytes = st.mm_checkpoint_accounting->live_bytes;
+    st.mm_checkpoint_accounting->peak_bytes.store(st.mm_checkpoint_accounting->live_bytes.load());
     st.mm_pending_query.reset();
     try {
         st.mm_error.clear();
@@ -232,7 +244,6 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
             st.mm_reset_requested = false;
         }
         st.mm_new_text = st.mm_new_image = st.mm_replayed = st.mm_tail_replayed = 0;
-        if (st.vision) st.vision->reset_stats();
         const auto & prompt = *st.active_prompt;
         const int eval_end = (int) prompt.tokens.size() - (st.spec.ok ? 1 : 0);
         const int lcp = st.cached_prompt ? (int) prompt.common_prefix(*st.cached_prompt) : 0;
@@ -442,7 +453,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
         }
         kvmem_diag("KVMEM_TRACE multimodal_prefill context=%p prefix_hit_rows=%d lcp=%d new_text_rows=%u new_image_rows=%u replayed_rows=%u vision_encode_calls=%u encoder_ms=%.2f logical_cursor=%d model_cursor=%d mtp_synced_rows=%d cached_tail_rows=%u replay_reason=%s embedding_cache_bytes=%zu checkpoint_bytes=%zu\n",
                 (void *) st.ctx, base.row, lcp, st.mm_new_text, st.mm_new_image, st.mm_replayed,
-                st.vision ? st.vision->encode_calls : 0, st.vision ? st.vision->encode_ms : 0.0,
+                prompt.encode_calls, prompt.encode_ms,
                 eval_end, prompt.model_pos(eval_end), synced, st.mm_tail_replayed, st.mm_replayed ? reason.c_str() : "none",
                 st.vision ? st.vision->cache_bytes() : 0,
                 std::accumulate(st.mm_checkpoints.begin(), st.mm_checkpoints.end(), size_t(0),
@@ -466,7 +477,7 @@ static bool run_prefill_multimodal(ServerState & st, StreamIo * io, int * n_cach
                 p.first_ms, p.replay_ms, p.retrieval_ms, p.select_checkpoint_ms, p.save_ms, p.restore_ms,
                 p.mean_ms, p.carry_ms, p.saves, p.restores, p.shared, p.restore_skips, unique_bytes);
         kvmem_diag("KVMEM_CHECKPOINT_MEMORY ref_bytes=%zu unique_bytes=%zu live_bytes=%zu peak_bytes=%zu\n",
-                ref_bytes, unique_bytes, st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
+                ref_bytes, unique_bytes, st.mm_checkpoint_accounting->live_bytes.load(), st.mm_checkpoint_accounting->peak_bytes.load());
         if (copies_before.enabled) {
             const auto copies = llama_kvmem_get_transfer_stats();
             fprintf(stderr, "KVMEM_PREFILL_PHASE path=%s first_ms=%.3f replay_ms=%.3f retrieval_ms=%.3f replay_rows=%u query=[%d,%d)\n",
@@ -502,7 +513,7 @@ static void multimodal_commit(ServerState & st, const std::vector<llama_token> &
     st.mm_rollback.reset();
     st.mm_rollback_prompt.reset();
     kvmem_diag("KVMEM_CHECKPOINT_COMMIT live_bytes=%zu peak_bytes=%zu\n",
-            st.mm_checkpoint_accounting->live_bytes, st.mm_checkpoint_accounting->peak_bytes);
+            st.mm_checkpoint_accounting->live_bytes.load(), st.mm_checkpoint_accounting->peak_bytes.load());
 }
 
 static int multimodal_decode_generated(ServerState & st, llama_token id, int row) {

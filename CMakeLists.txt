@@ -32,6 +32,12 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 enable_testing()
 add_subdirectory(kvmem)
 
+find_package(Threads REQUIRED)
+add_executable(kvmem-lane-pool-test tests/lane-pool-test.cpp)
+target_include_directories(kvmem-lane-pool-test PRIVATE tools)
+target_link_libraries(kvmem-lane-pool-test PRIVATE Threads::Threads)
+add_test(NAME kvmem-lane-pool-test COMMAND kvmem-lane-pool-test)
+
 # Conversation selection and eviction policy: header-only and free of llama.cpp
 # and CUDA, so it stays testable in the portable KVMEM_BUILD_LLAMA=OFF build.
 add_executable(kvmem-conversation-store-test tests/conversation-store-test.cpp)
@@ -62,6 +68,7 @@ else()
 endif()
 
 option(KVMEM_BUILD_LLAMA "Build llama.cpp with the KVMem adapter" ON)
+option(KVMEM_BUILD_SERVER_TESTS "Build model-free server compatibility tests" ${KVMEM_BUILD_LLAMA})
 option(KVMEM_ROCM "Build KVMem with the HIP/ROCm backend" OFF)
 if (KVMEM_ROCM)
     set(GGML_HIP ON CACHE BOOL "ggml: use HIP" FORCE)
@@ -79,6 +86,15 @@ if (KVMEM_BUILD_LLAMA AND GGML_HIP)
     set(KVMEM_GPU_BACKEND "HIP")
 else()
     set(KVMEM_GPU_BACKEND "CUDA")
+endif()
+
+if (KVMEM_BUILD_LLAMA OR KVMEM_BUILD_SERVER_TESTS)
+    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_TOOLS ON CACHE BOOL "")
+    set(LLAMA_BUILD_COMMON ON CACHE BOOL "")
 endif()
 
 if (KVMEM_BUILD_LLAMA)
@@ -189,17 +205,10 @@ if (KVMEM_BUILD_LLAMA)
     # Default llama.cpp FA vec kernels are only F16/Q4_0/Q8_0/BF16. q5_0 KV
     # (and q4_1/q5_1) need this or FlashAttention refuses those types and
     # Qwen3.8 hybrid prefill collapses (~75 t/s vs ~500).
-    set(GGML_CUDA_FA_ALL_QUANTS ON CACHE BOOL
+    set(GGML_CUDA_FA_QUANTS "all" CACHE STRING
         "compile all FlashAttention KV quants (needed for --kv-dtype q5_0)" FORCE)
     set(LLAMA_KVMEM ON CACHE BOOL "" FORCE)
     set(LLAMA_KVMEM_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH "" FORCE)
-    set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_APP OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_TOOLS ON CACHE BOOL "")
-    set(LLAMA_BUILD_COMMON ON CACHE BOOL "")
-
     add_subdirectory(llama.cpp)
 
     if (KVMEM_GPU_BACKEND STREQUAL "HIP")
@@ -326,6 +335,19 @@ if (KVMEM_BUILD_LLAMA)
     add_test(NAME kvmem-gdn-replay-test COMMAND kvmem-gdn-replay-test)
     set_tests_properties(kvmem-gdn-replay-test PROPERTIES SKIP_RETURN_CODE 77)
 
+    add_executable(kvmem-gdn-output-fusion-test tests/gdn-output-fusion-test.cpp)
+    target_link_libraries(kvmem-gdn-output-fusion-test PRIVATE ggml)
+    add_test(NAME kvmem-gdn-output-fusion-test COMMAND ${CMAKE_COMMAND} -E env
+        --unset=KVMEM_GDN_OUT_FUSION $<TARGET_FILE:kvmem-gdn-output-fusion-test>)
+    set_tests_properties(kvmem-gdn-output-fusion-test PROPERTIES SKIP_RETURN_CODE 77)
+
+elseif (KVMEM_BUILD_SERVER_TESTS)
+    # These tests use llama-common and mtmd, without the GPU-only KVMem adapter.
+    set(LLAMA_KVMEM OFF CACHE BOOL "" FORCE)
+    add_subdirectory(llama.cpp)
+endif()
+
+if (KVMEM_BUILD_SERVER_TESTS)
     add_executable(kvmem-reasoning-budget-test tests/reasoning-budget-test.cpp)
     target_include_directories(kvmem-reasoning-budget-test PRIVATE tools)
     target_link_libraries(kvmem-reasoning-budget-test PRIVATE llama-common)

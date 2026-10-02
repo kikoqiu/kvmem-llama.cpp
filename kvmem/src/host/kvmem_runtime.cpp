@@ -53,6 +53,19 @@ KvMemRuntime::KvMemRuntime(KvMemRuntimeConfig cfg, KvMemBackend *backend)
     }
 }
 
+void KvMemRuntime::rebind_backend(KvMemBackend * backend) {
+    if (pending_ || !pending_gpu_frees_.empty()) {
+        throw std::logic_error("cannot rebind a runtime with a pending plan");
+    }
+    wait_prefetch();
+    for (const auto & block : store_.blocks()) {
+        if (block.gpu_slot >= 0 || block.in_flight) {
+            throw std::logic_error("cannot rebind a GPU-resident runtime");
+        }
+    }
+    backend_ = backend ? backend : &null_backend_;
+}
+
 uint8_t *KvMemRuntime::cpu_ptr(int32_t slot) {
     if (slot < 0 || cpu_arena_.empty()) {
         return nullptr;

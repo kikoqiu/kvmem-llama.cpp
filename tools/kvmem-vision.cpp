@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <chrono>
 #include <stdexcept>
+#include <set>
 
 kvmem_prompt::kvmem_prompt(const std::vector<llama_token> & input)
     : tokens(input), native_(std::make_shared<server_tokens>(input, true)) {}
@@ -100,19 +101,20 @@ size_t kvmem_prompt::index_bytes() const {
     return bytes;
 }
 
-std::string kvmem_parse_media_messages(const std::string & body, bool allow_images,
+std::string kvmem_parse_media_messages(const std::string & body, bool allow_images, bool allow_video,
                                       std::vector<std::vector<uint8_t>> & files) {
     auto parsed = common_json::parse(body);
     server_chat_params params;
     params.allow_image = allow_images;
     params.allow_audio = false;
-    params.allow_video = false;
+    params.allow_video = allow_video;
     oaicompat_chat_process_media(parsed, params, files);
     return parsed.dump();
 }
 
 kvmem_vision::kvmem_vision(llama_model * model, const std::string & path, bool gpu,
-                           ggml_backend_dev_t device, int min_tokens, int max_tokens, int n_threads) {
+                           ggml_backend_dev_t device, int min_tokens, int max_tokens, int n_threads,
+                           float video_fps) : video_fps_(video_fps) {
     auto params = mtmd_context_params_default();
     params.media_marker = get_media_marker();
     params.use_gpu = gpu;
@@ -133,40 +135,100 @@ kvmem_vision::kvmem_vision(llama_model * model, const std::string & path, bool g
 
 kvmem_vision::~kvmem_vision() { mtmd_free(ctx_); }
 
+bool kvmem_vision::supports_video() const {
+    return mtmd_helper_support_video(ctx_);
+}
+
 std::shared_ptr<kvmem_prompt> kvmem_vision::tokenize(const std::string & prompt,
                                                  const std::vector<std::vector<uint8_t>> & files) {
-    auto native = std::make_shared<server_tokens>(process_mtmd_prompt(ctx_, prompt, files, mtmd_helper_init_opt_default()));
+    std::lock_guard<std::mutex> lock(mu_);
+    auto opt = mtmd_helper_init_opt_default();
+    opt.video_params.fps_target = video_fps_;
+    auto native = std::make_shared<server_tokens>(process_mtmd_prompt(ctx_, prompt, files, opt));
     return std::make_shared<kvmem_prompt>(std::move(native));
+}
+
+bool kvmem_prompt::media_ready(size_t begin) const {
+    for (const auto & range : media_ranges()) {
+        if (range.second > begin && !embeddings_.count(range.first)) return false;
+    }
+    return true;
+}
+
+void kvmem_vision::prepare(kvmem_prompt & prompt, size_t begin,
+                           const std::function<bool()> & cancelled) {
+    constexpr size_t limit = 128ull*1024*1024;
+    std::unique_lock<std::timed_mutex> preparation(preparation_mu_, std::defer_lock);
+    while (!preparation.try_lock_for(std::chrono::milliseconds(50))) {
+        if (cancelled && cancelled()) throw std::runtime_error("media preparation cancelled");
+    }
+    std::unique_lock<std::mutex> lock(mu_);
+    const auto ranges = prompt.media_ranges();
+    size_t requested = 0;
+    std::set<std::string> distinct;
+    for (const auto & range : ranges) {
+        if (range.second <= begin && !prompt.embeddings_.count(range.first)) continue;
+        const auto * chunk = prompt.chunk(range.first);
+        if (!distinct.insert(mtmd_input_chunk_get_id(chunk)).second) continue;
+        const size_t tokens = mtmd_input_chunk_get_n_tokens(chunk);
+        if (tokens > limit / (sizeof(float)*(size_t)n_embd_)) {
+            throw std::invalid_argument("image embeddings exceed 128 MiB; reduce --image-max-tokens");
+        }
+        requested += tokens*(size_t)n_embd_*sizeof(float);
+        if (requested > limit) throw std::invalid_argument("prepared media exceeds 128 MiB; reduce image count or tokens");
+    }
+    for (const auto & range : ranges) {
+        if (range.second <= begin || prompt.embeddings_.count(range.first)) continue;
+        if (cancelled && cancelled()) throw std::runtime_error("media preparation cancelled");
+        const auto * chunk = prompt.chunk(range.first);
+        const std::string id = mtmd_input_chunk_get_id(chunk);
+        auto it = cache_.find(id);
+        if (it == cache_.end()) {
+            const size_t count = mtmd_input_chunk_get_n_tokens(chunk)*(size_t)n_embd_;
+            const size_t bytes = count*sizeof(float);
+            while (accounting_->bytes.load() + bytes > limit) {
+                auto victim = cache_.end();
+                for (auto candidate = cache_.begin(); candidate != cache_.end(); ++candidate) {
+                    if (candidate->second.embd.use_count() == 1 &&
+                            (victim == cache_.end() || candidate->second.used < victim->second.used)) victim = candidate;
+                }
+                if (victim != cache_.end()) {
+                    cache_bytes_ -= victim->second.embd->size()*sizeof(float);
+                    cache_.erase(victim);
+                } else {
+                    if (cancelled && cancelled()) throw std::runtime_error("media preparation cancelled");
+                    accounting_->changed.wait_for(lock, std::chrono::milliseconds(50));
+                }
+            }
+            const auto start = std::chrono::steady_clock::now();
+            if (mtmd_encode_chunk(ctx_, chunk) != 0) throw std::runtime_error("vision encoder failed");
+            ++prompt.encode_calls;
+            prompt.encode_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+            const float * data = mtmd_get_output_embd(ctx_);
+            if (!data) throw std::runtime_error("vision encoder returned no embeddings");
+            auto * values = new std::vector<float>(data, data + count);
+            auto accounting = accounting_;
+            accounting->bytes += bytes;
+            std::shared_ptr<const std::vector<float>> embedding(values, [accounting, bytes](const std::vector<float> * value) {
+                delete value;
+                accounting->bytes -= bytes;
+                accounting->changed.notify_all();
+            });
+            it = cache_.emplace(id, entry{std::move(embedding), 0}).first;
+            cache_bytes_ += bytes;
+        }
+        it->second.used = ++clock_;
+        prompt.embeddings_[range.first] = it->second.embd;
+    }
+    kvmem_diag("KVMEM_VISION_PREPARED encodes=%u encoder_ms=%.2f live_bytes=%zu\n",
+                prompt.encode_calls, prompt.encode_ms, accounting_->bytes.load());
 }
 
 int kvmem_vision::decode(llama_context * ctx, const kvmem_prompt & prompt, size_t row, int n_batch,
                        const std::function<int(llama_batch)> & dispatch) {
     const auto * chunk = prompt.chunk(row);
-    const std::string id = mtmd_input_chunk_get_id(chunk);
-    auto it = cache_.find(id);
-    if (it == cache_.end()) {
-        const size_t count = mtmd_input_chunk_get_n_tokens(chunk) * (size_t) n_embd_;
-        constexpr size_t limit = 128ull*1024*1024;
-        if (count > limit/sizeof(float)) throw std::runtime_error("image embeddings exceed 128 MiB; reduce --image-max-tokens");
-        while (cache_bytes_ + count*sizeof(float) > limit && !cache_.empty()) {
-            auto victim = std::min_element(cache_.begin(), cache_.end(), [](const auto & a, const auto & b) {
-                return a.second.used < b.second.used;
-            });
-            cache_bytes_ -= victim->second.embd.size()*sizeof(float);
-            cache_.erase(victim);
-        }
-        const auto start = std::chrono::steady_clock::now();
-        if (mtmd_encode_chunk(ctx_, chunk) != 0) throw std::runtime_error("vision encoder failed");
-        ++encode_calls;
-        encode_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        const float * embd = mtmd_get_output_embd(ctx_);
-        if (!embd) throw std::runtime_error("vision encoder returned no embeddings");
-        entry cached;
-        cached.embd.assign(embd, embd + count);
-        cache_bytes_ += count*sizeof(float);
-        it = cache_.emplace(id, std::move(cached)).first;
-    }
-    it->second.used = ++clock_;
+    const auto ready = prompt.embeddings_.find(row);
+    if (ready == prompt.embeddings_.end()) throw std::logic_error("media was not prepared before lane admission");
     struct callback_data {
         size_t row;
         const std::function<int(llama_batch)> * dispatch;
@@ -181,7 +243,7 @@ int kvmem_vision::decode(llama_context * ctx, const kvmem_prompt & prompt, size_
         return rc;
     };
     llama_pos next = prompt.model_pos(row);
-    const int rc = mtmd_helper_decode_image_chunk_with_decoder(ctx_, ctx, chunk, it->second.embd.data(),
+    const int rc = mtmd_helper_decode_image_chunk_with_decoder(ctx_, ctx, chunk, const_cast<float *>(ready->second->data()),
             next, 0, n_batch, &next, nullptr, &data, decode);
     if (rc == 0 && next != prompt.model_pos(prompt.media_end(row))) throw std::runtime_error("inconsistent image position cursor");
     return rc;

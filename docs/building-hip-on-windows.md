@@ -35,7 +35,7 @@ scripts\build-hip.bat
 `cmake` 配置（HIP 后端，强制关掉 CUDA 后端）→ 校验优化标志 → `cmake --build`。
 
 **耗时**：本机实测 `-j12` 约 **26 分钟**（578 个编译步骤）。首次编译慢是因为
-`GGML_CUDA_FA_ALL_QUANTS` 被强制打开（`--kv-dtype q5_0` 等 KV 类型的必要条件），
+`GGML_CUDA_FA_QUANTS=all` 被强制设置（`--kv-dtype q5_0` 等 KV 类型的必要条件），
 会多编 45 个 fattn-vec 实例。
 
 产物在 `build-hip\bin\`，主要是 `llama-kvmem-server.exe` + 一组 DLL。
@@ -404,7 +404,7 @@ prompt eval time =     650.16 ms /    46 tokens (   14.13 ms per token,    70.75
 
 ## 5. 以后想更新上游代码
 
-KVMem 的补丁是**针对 pin `b81c99b` 的累积 diff**，所以：
+当前 master 的 KVMem 补丁是**针对 llama.cpp `v0.5.0` (`7fe450e19`) 的累积 diff**，所以：
 
 - **只想重建**：什么都不用做，直接 §1。
 - **想换 llama.cpp 版本**：不能直接 `git pull`。需要先 rebase 补丁，用上游的

@@ -1,13 +1,14 @@
 # Multi-conversation KV cache
 
 For the optional RAM/NVMe extension, capacity admission and disk restore, see
-[Session disk cache](session-disk-cache.md). The policy below describes the
-original RAM-only mode unless stated otherwise.
+[Session disk cache](session-disk-cache.md). For dynamic scheduling across multiple lanes, see [Multi-lane conversations](multi-lane-conversations.md).
+The policy below describes the original single-lane RAM-only mode unless stated otherwise.
 
 `--kvmem-conversations N` lets the server hold N conversations' KV in host RAM
 at the same time and switch between them. With the flag absent, or set to `1`,
 the server behaves exactly as before: a request that does not continue the
-stored conversation discards it. Host RAM is the abundant resource and GPU VRAM
+stored conversation discards it. This section describes `--parallel 1`; with
+`--parallel P` (P=2..4), N is global and automatically raised to at least P. Host RAM is the abundant resource and GPU VRAM
 is the scarce one, so the design is one `llama_context`, one GPU working set,
 N host stores, time-multiplexed. Requests are still served one at a time.
 

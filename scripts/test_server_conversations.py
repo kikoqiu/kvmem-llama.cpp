@@ -26,6 +26,7 @@ p.add_argument('--server', required=True)
 p.add_argument('--model', required=True)
 p.add_argument('--output', required=True)
 p.add_argument('--mtp', action='store_true')
+p.add_argument('--device', default='CUDA0')
 p.add_argument('--gpu', help='CUDA GPU UUID or index to expose to the test servers')
 p.add_argument('--kv-key-dtype', default='q8_0')
 p.add_argument('--kv-value-dtype', default='q8_0')
@@ -103,7 +104,7 @@ def run_case(label, extra_args, script, probe=None):
     """
     port = free_port()
     base = f'http://127.0.0.1:{port}'
-    args = [a.server, '-m', a.model, '--host', '127.0.0.1', '--port', str(port),
+    args = [a.server, '-m', a.model, '--device', a.device, '--host', '127.0.0.1', '--port', str(port),
             '-c', '16384', '-n', '128', '--api-key', 'api-test-only', '--threads-http', '4',
             '--reasoning-effort', 'none', '--temp', '0', '--no-webui',
             '-ctk', a.kv_key_dtype, '-ctv', a.kv_value_dtype,

@@ -18,6 +18,8 @@ class BuildPlanTests(unittest.TestCase):
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name) / 'project with spaces'
         self.root.mkdir()
+        # Match main()'s resolved source root, including Windows short temp paths.
+        self.root = self.root.resolve()
         self.sdk = Path(self.directory.name) / 'sdk'
         (self.sdk / 'llvm/bin').mkdir(parents=True)
         for name in ('clang++', 'clang++.exe'):

@@ -31,8 +31,8 @@ slot; only `stage_out` cells are `seq_rm`'d. Flash Attention is not
 modified. P1 recency does not re-RoPE and does not resurrect dropped
 blocks.
 
-The host store is per conversation; the GPU working set and the `llama_context`
-stay single. `--kvmem-conversations N` keeps N host stores alive and
+With the default `--parallel 1`, the host store is per conversation; the GPU
+working set and the `llama_context` stay single. `--kvmem-conversations N` keeps N host stores alive and
 time-multiplexes them, so a conversation that returns after another was served
 does not have to be reprocessed. A switch drains the whole working set to host
 and rebuilds the incoming store's through the drain-and-restage path that
@@ -41,6 +41,29 @@ already runs inside a conversation (the host fallback in
 `src/adapter/llama-memory-kvmem.cpp`), not a second implementation. Requests
 stay serialized and `n_seq_max` stays 1; the recurrent half is still a
 server-side byte snapshot restored per request.
+
+### Multiple lanes and conversations
+
+`--kvmem --parallel P --kvmem-conversations N`, with P=2..4, creates P independent target
+contexts sharing immutable model weights, with one global host conversation
+pool. Effective N is at least P. Each lane owns its GPU window, recurrent state,
+MTP follower (when enabled), capture state and transfer scratch. GPU context,
+retrieval and generation budgets apply per lane; `--kvmem-cpu-gb` applies per
+host store. Startup verifies compatible KV geometry across lanes.
+
+Admission uses FIFO among ready, eligible conversation heads. Same-ID requests
+serialize; unrelated ready requests can use any free lane. A warm residency is
+preferred, but is never a permanent assignment. A switch quiesces the outgoing
+lane, invalidates its attention/MTP cells and transfers a backend-neutral host
+bundle by ownership, then restores incoming checkpoints. GPU buffers are reused.
+
+One shared projector can run on CPU or another device, including the lane GPU.
+Stateful tokenization/encoding is serialized before lane admission; immutable
+prepared embeddings are decoded independently. The embedding cache and in-flight
+references share a 128 MiB bound. Text and image requests support optional MTP on
+one CUDA target GPU with at least `2 * P` HTTP workers. Video/audio, multiple target
+GPUs and NVMe/session disk are outside multi-lane support. Throughput depends on the
+workload and device. See [the complete design](multi-lane-conversations.md).
 
 Hardware split on this machine: RTX 5050 (GPU 0) for models < 27B;
 RTX 5090 (GPU 1) for 27B. Details in `scripts/gpu.sh` and

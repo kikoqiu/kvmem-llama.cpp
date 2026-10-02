@@ -1,11 +1,25 @@
 # llama.cpp patch replay
 
-`llama-kvmem-current.patch` is the cumulative diff against pinned `b81c99b`.
+`llama-kvmem-current.patch` is the cumulative diff against the pinned
+llama.cpp `v0.5.0` release (`7fe450e19305b828c199d602c23a8337aaa1f03b`).
 It includes the existing KVMem hooks, multimodal batch, MTP, media
 parser and mtmd helper extensions, plus FP32 GDN Record/Fold for ReplaySSM.
 It also fixes reasoning-budget initialization from a template's generation prefix.
 `scripts/apply-patches.sh` applies it
 without creating commits and checks for an already applied tree.
+
+`cuda-graph-decode.patch` applies after that cumulative diff. It keeps one
+decode graph per output width 1..8, restores scheduler `src` edges before the
+next split, and returns from empty `GET_ROWS`. Set
+`KVMEM_DECODE_GRAPH_SLOTS=0` to use the previous two-slot path. A tree with
+this patch applied no longer reverses `llama-kvmem-current.patch` alone.
+
+`cuda-graph-reactivation.patch` applies after the graph and GDN output patches.
+Decode widths share one scheduler arena, so an inactive graph's old tensor
+bindings may have been overwritten by another graph. Reactivation rebuilds the
+graph and its KVMem capture list; consecutive uses of the active graph retain
+reuse. This fixes invalid KV row indices observed under mixed short/long
+concurrent requests. Both build entry points replay this fix idempotently.
 
 `0005-hip-rdna2-quantized-kv-fa-vec.patch` is @zintown's PR #58 RDNA2
 quantized-KV Flash Attention dispatch fix. It selects the existing VEC kernel
@@ -28,7 +42,7 @@ To check a clean extraction without changing your active llama.cpp checkout:
 
 ```bash
 git clone https://github.com/ggml-org/llama.cpp /tmp/kvmem-llama-patch-check
-git -C /tmp/kvmem-llama-patch-check checkout b81c99b
+git -C /tmp/kvmem-llama-patch-check checkout 7fe450e19305b828c199d602c23a8337aaa1f03b
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 KVMEM_LLAMA_DIR=/tmp/kvmem-llama-patch-check scripts/apply-patches.sh
 ```

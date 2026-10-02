@@ -42,6 +42,8 @@ public:
     // True while a prepared plan has not been applied yet (prepare_selection /
     // prepare_prefill_pressure set it, admit_incoming clears it).
     bool pending() const { return pending_; }
+    // A parked runtime has no GPU slots or unapplied transfers.
+    void rebind_backend(KvMemBackend * backend);
     size_t allocated_bytes() const {
         size_t bytes = sizeof(*this) + store_.allocated_bytes() + cpu_arena_.capacity() + scratch_.capacity();
         bytes += last_plan_.stage_in.capacity()*sizeof(uint32_t) +

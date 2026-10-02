@@ -4,26 +4,156 @@ on:
   pull_request:
   push:
     branches: [master]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  host-and-server-units-linux:
+  host-linux:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        nvme: ['OFF', 'ON']
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: bash scripts/apply-patches.sh
+      - run: python3 tests/test_launcher_key_file.py
+      - run: python3 scripts/test_start_server.py
+      - run: python3 scripts/test_build_rocm.py
+      - name: Configure host and model-free server tests
+        env:
+          NVME: ${{ matrix.nvme }}
+        run: >-
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DKVMEM_BUILD_LLAMA=OFF -DKVMEM_BUILD_SERVER_TESTS=ON
+          -DKVMEM_ENABLE_NVME="$NVME" -DGGML_NATIVE=OFF
+          -DGGML_CUDA=OFF -DGGML_HIP=OFF
+      - run: cmake --build build --parallel 2
+      - run: ctest --test-dir build --output-on-failure --no-tests=error
+      - run: bash scripts/test_server_portable.sh build/portable
+  host-windows:
+    runs-on: windows-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
       - run: bash scripts/apply-patches.sh
-      - run: python3 tests/test_launcher_key_file.py
-      - run: python3 scripts/test_start_server.py
-      # The full KVMem adapter requires CUDA; this runner validates portable host code.
-      - run: cmake -S . -B build -DKVMEM_BUILD_LLAMA=OFF -DKVMEM_ENABLE_NVME=OFF
-      - run: cmake --build build --parallel 2
-      - run: ctest --test-dir build --output-on-failure
-      - run: bash scripts/test_server_portable.sh build/portable
+      - run: python scripts/test_build_rocm.py
+      - name: Configure host and model-free server tests
+        run: >-
+          cmake -S . -B build -A x64
+          -DKVMEM_BUILD_LLAMA=OFF -DKVMEM_BUILD_SERVER_TESTS=ON
+          -DKVMEM_ENABLE_NVME=OFF -DGGML_NATIVE=OFF
+          -DGGML_CUDA=OFF -DGGML_HIP=OFF
+      - run: cmake --build build --config Release --parallel 2
+      - run: ctest --test-dir build -C Release --output-on-failure --no-tests=error
+      - name: Test native PowerShell launcher
+        shell: powershell
+        run: ./scripts/windows/test-launcher.ps1
+      - name: Test Windows packaging
+        shell: powershell
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $dumpbin = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find 'VC/Tools/MSVC/**/bin/Hostx64/x64/dumpbin.exe' | Select-Object -First 1
+          if (!$dumpbin) { throw 'MSVC dumpbin was not found' }
+          $env:PATH = "$(Split-Path -Parent $dumpbin);$env:PATH"
+          ./scripts/windows/test-package.ps1 -TestExe "$PWD/build/bin/Release/kvmem_store_test.exe"
+  cuda-build-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    container: nvidia/cuda:12.8.1-devel-ubuntu24.04
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 1G
+      CCACHE_COMPILERCHECK: content
+    steps:
+      - name: Install build dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends git ca-certificates build-essential cmake ninja-build libssl-dev python3 time ccache zstd
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - run: bash scripts/apply-patches.sh
+      - name: Identify the compiler toolchain
+        id: toolchain
+        run: |
+          c++ --version > "$RUNNER_TEMP/compiler-versions.txt"
+          nvcc --version >> "$RUNNER_TEMP/compiler-versions.txt"
+          ccache --version >> "$RUNNER_TEMP/compiler-versions.txt"
+          sha256sum "$(command -v c++)" "$(command -v nvcc)" "$(command -v ccache)" >> "$RUNNER_TEMP/compiler-versions.txt"
+          printf 'id=%s\n' "$(sha256sum "$RUNNER_TEMP/compiler-versions.txt" | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+      - name: Restore compiler cache
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          # Keep one snapshot per build/kernel configuration, rather than per commit.
+          key: cuda12.8.1-120a-ccache-v1-${{ steps.toolchain.outputs.id }}-${{ hashFiles('.github/workflows/server-compat.yml', 'CMakeLists.txt', 'kvmem/CMakeLists.txt', 'patches/**', 'llama.cpp/ggml/src/ggml-cuda/**') }}
+          restore-keys: |
+            cuda12.8.1-120a-ccache-v1-${{ steps.toolchain.outputs.id }}-
+            cuda12.8.1-120a-ccache-v1-
+      - name: Prepare the CUDA driver stub for linking
+        run: |
+          mkdir -p "$RUNNER_TEMP/cuda-driver-stubs"
+          ln -s /usr/local/cuda/lib64/stubs/libcuda.so "$RUNNER_TEMP/cuda-driver-stubs/libcuda.so.1"
+      - name: Configure the complete CUDA build
+        # Compile for Blackwell without probing for a GPU on the standard runner.
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DBUILD_SHARED_LIBS=ON -DKVMEM_BUILD_LLAMA=ON
+          -DKVMEM_ENABLE_NVME=ON -DGGML_CUDA=ON -DGGML_NATIVE=OFF
+          -DGGML_CCACHE=OFF -DCMAKE_C_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DCMAKE_CUDA_COMPILER_LAUNCHER=ccache
+          -DCMAKE_CUDA_ARCHITECTURES=120a-real
+          -DCMAKE_EXE_LINKER_FLAGS="-Wl,-rpath-link,$RUNNER_TEMP/cuda-driver-stubs"
+      - name: Build and link all targets
+        run: |
+          nproc
+          free -h
+          ccache --zero-stats
+          /usr/bin/time -v cmake --build build --parallel 2
+          if [ -r /sys/fs/cgroup/memory.peak ]; then
+            printf 'Container peak memory (bytes): '
+            cat /sys/fs/cgroup/memory.peak
+          fi
+      - name: Compiler cache statistics
+        if: ${{ always() }}
+        run: ccache --show-stats
+  # Keep the existing required check name and fail if any backend check is skipped or fails.
+  host-and-server-units-linux:
+    if: ${{ always() }}
+    needs: [host-linux, host-windows, cuda-build-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all host and build checks
+        env:
+          LINUX_RESULT: ${{ needs.host-linux.result }}
+          WINDOWS_RESULT: ${{ needs.host-windows.result }}
+          CUDA_RESULT: ${{ needs.cuda-build-linux.result }}
+        run: |
+          test "$LINUX_RESULT" = success
+          test "$WINDOWS_RESULT" = success
+          test "$CUDA_RESULT" = success
   ui-linux:
     runs-on: ubuntu-latest
     timeout-minutes: 20

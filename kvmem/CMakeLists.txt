@@ -38,6 +38,7 @@ function(kvmem_add_test name)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+kvmem_add_test(backend_rebind_test)
 kvmem_add_test(kvmem_store_test)
 kvmem_add_test(pinned_kv_tier_test)
 if (WIN32)

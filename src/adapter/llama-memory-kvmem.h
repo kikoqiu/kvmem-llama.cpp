@@ -98,6 +98,7 @@ public:
     void register_capture(struct ggml_tensor * t, int il, char which);
     void capture_on_new_graph();
     bool capture_can_reuse(uint32_t n_tokens, uint32_t n_pos, const llama_pos * pos) const;
+    uint64_t capture_stamp() const;
     void harvest_pending(struct ggml_backend_sched * sched);
     void harvest_flush();
     void harvest_perf_print_sum();
@@ -208,10 +209,11 @@ public:
     // attention V is not mirrored to host, and raw-K NVMe sizes and names one
     // arena per process.
     bool conv_swap_supported(std::string & reason) const;
+    bool conv_compatible(const llama_memory_kvmem & other) const;
     std::unique_ptr<ConvStore> make_conv();
     // Exchange the per-conversation host state. Call only between requests,
     // under the server's request lock. `conv` must come from make_conv() or an
-    // earlier swap_conv() on this object; on return it holds the outgoing
+    // earlier swap_conv() on a compatible memory object; on return it holds the outgoing
     // conversation, drained to host. False means the incoming store holds no
     // rows live on the GPU: it was empty, or its working set could not be
     // rebuilt from host RAM and it was reset to empty. Either way the server

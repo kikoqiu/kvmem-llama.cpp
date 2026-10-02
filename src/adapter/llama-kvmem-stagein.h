@@ -9,6 +9,11 @@
 #include <cstddef>
 #include <cstdint>
 
+struct kvmem_gpu_state;
+kvmem_gpu_state * kvmem_gpu_state_create();
+// The owning execution state must be active while destroying GPU scratch.
+void kvmem_gpu_state_free(kvmem_gpu_state * state);
+
 bool kvmem_stagein_gpu_ready(size_t n_f32, size_t n_packed = 0);
 void kvmem_stagein_gpu_free();
 

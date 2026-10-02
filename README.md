@@ -44,7 +44,7 @@ Core flags (what the 16 GiB recipes still pass):
 | `--kvmem-protect-system` | Keep this request's system prompt in the GPU working set. On by default: the server measures the system-message span of each request and pins those blocks, so retrieval never swaps them out. Recomputed every request, so it is per message, not a global setting. `--no-kvmem-protect-system` lets the system prompt compete for retrieval slots like ordinary history. |
 | `--kvmem-gen-reserve` | GPU slots reserved for new tokens so retrieval cannot fill the pool. When a generation fills them, `--kvmem-gen-exceed` decides what happens. |
 | `--kvmem-gen-exceed MODE` | `retrieval` (default) reswaps `budget + gen_reserve` once the reserve is full, which frees the reserve region and continues; a request that omits `max_tokens` defaults to that whole pool. `error` keeps the v1 stop, caps `max_tokens` at the reserve and keeps the reserve as the omitted default. The swap ranks this turn's blocks and older history on the same query score and stages out the losers. Kept before scoring: the `--kvmem-sink-tokens` prefix, the `--kvmem-recent-tokens` suffix, the query span, the incoming rows and the block being written. |
-| `--kvmem-conversations N` | How many conversations retain their KV in host RAM or the optional session disk cache. Default `1` reproduces earlier behavior, where a different conversation discards the previous one. Higher values let the server switch between conversations without reprocessing them; requests are still served one at a time. Needs flash attention. |
+| `--kvmem-conversations N` | How many conversations retain their KV in host RAM or the optional session disk cache. Default `1` reproduces earlier behavior, where a different conversation discards the previous one. Higher values let the server switch between conversations without reprocessing them. With `--parallel P`, the effective count is `max(N, P)` and up to P requests run together. Needs flash attention. |
 | `--kvmem-conversations-gb GB` | Soft cap on accounted RAM summed over active and inactive sessions. Move inactive sessions to NVMe by LRU when enabled, or evict them when RAM-only; an oversized active session continues with a warning. Default `0` means no byte cap. Requires `--kvmem-conversations N` with `N > 1`. |
 | `--kvmem-session-ram-gb GB` | Alias for the total active + inactive session RAM **soft** cap. Active KV may exceed it; idle KV moves to NVMe by LRU when enabled. `0` remains unlimited. |
 | `--kvmem-session-nvme-gb GB` | Enable disk storage for inactive sessions with this total quota. RAM pressure spills sessions to disk; disk pressure discards them by LRU. Default `0` disables it. |
@@ -52,10 +52,11 @@ Core flags (what the 16 GiB recipes still pass):
 | `--kv-dtype` | Sets the same cache type for **main** attention K and V (IQ3 q8_0, IQ4 q5_0). Use `-ctk q8_0 -ctv q4_0` for mixed precision. |
 | `--spec-type draft-mtp` | Enable multi-token prediction. |
 | `--mmproj` | Vision projector GGUF. Omit for text-only. |
+| `--video-fps F` | Video sampling rate, default `2.0` FPS. A finite value `<=0` uses the video's native frame rate. See [Video input](#video-input). |
 
 KVMem retrieval is on by default, with 128-token blocks, query replay `auto`, query policy `user`, MTP draft length 3, F16 draft KV, and ReplaySSM. You do not need to pass those unless you are overriding them. GPU KV size is `budget + gen_reserve`. When history exceeds `--kvmem-budget`, retrieval picks blocks for the current last-user query. Clients should send the full `messages` history each turn. A generation that fills `gen_reserve` reswaps the pool (`--kvmem-gen-exceed retrieval`, the default); `--kvmem-gen-exceed error` restores the v1 hard limit.
 
-With `--kvmem-conversations` above 1, that history is also the conversation's identity: no client API change and no conversation id are required. A request that continues a stored conversation extends it, while a request that only shares a system prompt or chat template starts a separate one instead of truncating the stored tail. A match is usable only when a recurrent checkpoint exists at or before it; otherwise the request is an ordinary cache miss. Details and limits are in [Multi-conversation KV cache](docs/multi-conversation-kv-cache.md).
+With `--kvmem-conversations` above 1, that history is also the conversation's identity: no client API change and no conversation id are required. A request that continues a stored conversation extends it, while a request that only shares a system prompt or chat template starts a separate one instead of truncating the stored tail. A match is usable only when a recurrent checkpoint exists at or before it; otherwise the request is an ordinary cache miss. Details and limits are in [Multi-conversation KV cache](docs/multi-conversation-kv-cache.md). Combine `--parallel 2 --kvmem-conversations 3` for two GPU working sets and three host caches with dynamic lane assignment; see [Multi-lane conversations](docs/multi-lane-conversations.md).
 
 For example, add `--kvmem-conversations 3 --kvmem-session-ram-gb 12 --kvmem-session-nvme-gb 40 --kvmem-session-cache-dir D:/KVMem/session-cache` to retain sessions across RAM and disk. The active session must fit the machine's actual RAM. A new server run reclaims marked, unlocked cache directories left by earlier runs, while preserving live servers' caches. Legacy directories without a marker and files that fail deletion need manual attention. See [Session disk cache](docs/session-disk-cache.md) for accounting and recovery, the [1:10 multi-session stability test](docs/session-exchange-stability.md) for the large exchange check, and the [three-session 5 GiB K8/V4 test](docs/three-session-5g-k8v4-stability.md) for a real-model 10 GiB NVMe and cold-prefill comparison.
 
@@ -125,16 +126,16 @@ The [native Windows CUDA build](scripts/windows/README.md) disables the legacy r
 ```bash
 git clone https://github.com/kvmem/kvmem-llama.cpp.git
 cd kvmem-llama.cpp
-git checkout v0.17.0
+git checkout master
 git clone https://github.com/ggml-org/llama.cpp llama.cpp
-git -C llama.cpp checkout b81c99b
+git -C llama.cpp checkout 7fe450e19
 scripts/apply-patches.sh
 scripts/build-cuda.sh
 ```
 
-The patches target ggml-org/llama.cpp at pin `b81c99b`. This tree does not track llama.cpp: the standalone build above clones it into `llama.cpp/`, and `KVMEM_BUILD_LLAMA=ON` (the default) builds that directory. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` (or `multimodal-upgrade.patch` on an older KVMem tree). Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. See [patches/README.md](patches/README.md).
+The patches target ggml-org/llama.cpp at pin `7fe450e19` (release `v0.5.0`). This tree does not track llama.cpp: the standalone build above clones it into `llama.cpp/`. `scripts/apply-patches.sh` applies `patches/llama-kvmem-current.patch` and the separate RDNA2 patch. Running it twice is safe. Do **not** apply numbered `0001`–`0004` together with the cumulative patch. The published `v0.17.0` and `v0.16.0-rc3` tags retain their original `b81c99b` pin; use `master` to build this revision. See [patches/README.md](patches/README.md).
 
-`scripts/build-cuda.sh` sets `GGML_CUDA_FA_ALL_QUANTS=ON` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
+`scripts/build-cuda.sh` sets `GGML_CUDA_FA_QUANTS=all` (needed for `--kv-dtype q5_0` on hybrid models). Binaries: `build/bin/llama-kvmem-server`.
 
 The build script defaults to `CMAKE_CUDA_ARCHITECTURES=120a-real` for the tested RTX 5060 Ti. For another GPU, set `CMAKE_CUDA_ARCHITECTURES` to its appropriate target when running the script; other GPU targets have not been tested here.
 
@@ -189,7 +190,7 @@ routes require the key like `/props` and `/slots`.
 
 The rc3 version of `llama-kvmem-server` accepts the common flags below with
 their llama.cpp meanings. Use the rc3 binaries or rebuild from source; rc2
-binaries predate these additions. This is an independent, single-slot server, so it does not
+binaries predate these additions. This is an independent server with one lane by default, so it does not
 yet accept every `llama-server` option.
 
 | Options | Meaning |
@@ -201,9 +202,9 @@ yet accept every `llama-server` option.
 | `-a`, `--alias` | Model name returned by `/v1/models`, `/props` and chat responses. |
 | `--api-key`, `--api-key-file` | API authentication; details below. |
 | `-lm`, `--load-mode` | `auto`, `none`, `mmap`, `mlock`, `mmap+mlock`, `dio`; legacy `--mmap`, `--no-mmap`, `--mlock` map to the corresponding mode. Last loading-mode flag wins. |
-| `-np`, `--parallel` | Only `1` is supported. Automatic or multiple slots produce an error. |
+| `-np`, `--parallel` | `1` (default) through `4` independent inference lanes sharing model weights and a global conversation pool. Supports text/images and optional MTP on one CUDA device, with a shared CPU/GPU projector. NVMe/session disk remains single-lane. KV budgets apply per lane; host RAM budgets apply per conversation. See [design](docs/multi-lane-conversations.md). |
 | `-to`, `--timeout` | HTTP read/write timeout in seconds; KVMem retains its 1800-second default. |
-| `--threads-http` | HTTP worker count; <= 0 selects automatically. This does not enable parallel inference slots. |
+| `--threads-http` | HTTP worker count; <= 0 selects automatically. Multiple inference lanes require at least `2 * parallel` HTTP workers; automatic selection enforces this floor. |
 | `-dev`, `--device`; `--list-devices` | Select one device or an explicit CUDA list such as `CUDA0,CUDA1`; `none` selects CPU. List devices without loading a model. |
 | `-mg`, `--main-gpu`; `-sm`, `--split-mode` | Experimental CUDA multi-GPU supports `layer` or `tensor` with `--gpu-layers all`. `none` remains available for one GPU. |
 | `-ts`, `--tensor-split` | Split proportions, with one value for each explicitly selected GPU. |
@@ -269,6 +270,9 @@ Regression checks: `kvmem-server-options-test` and
 `python scripts/test_server_compat.py --server /path/to/llama-kvmem-server`.
 Add `--model PATH` for live auth/inference checks, `--mtp` for MTP, and
 `--mmproj PATH --image PATH` for the optional vision fixture containing `6037`.
+Dynamic lane/conversation integration (optional `--mmproj`, `--mmproj-device`, `--mtp`):
+`python scripts/test_server_lane_conversations.py --server PATH --model PATH --output DIR`.
+
 Interleaved conversations need a model of their own:
 `python scripts/test_server_conversations.py --server PATH --model PATH --output DIR`.
 
@@ -288,7 +292,7 @@ A CLI key does not revoke an environment key.
 | `LLAMA_ARG_HOST`, `LLAMA_ARG_PORT`, `LLAMA_ARG_TIMEOUT`, `LLAMA_ARG_THREADS_HTTP` | HTTP server |
 | `LLAMA_ARG_CTX_SIZE`, `LLAMA_ARG_N_PREDICT`, `LLAMA_ARG_BATCH`, `LLAMA_ARG_UBATCH`, `LLAMA_ARG_THREADS` | Context, output and CPU/batch configuration |
 | `LLAMA_ARG_DEVICE`, `LLAMA_ARG_N_GPU_LAYERS`, `LLAMA_ARG_MAIN_GPU`, `LLAMA_ARG_SPLIT_MODE`, `LLAMA_ARG_TENSOR_SPLIT` | GPU selection; the same CUDA layer/tensor multi-GPU restrictions apply |
-| `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_CACHE_TYPE_K`, `LLAMA_ARG_CACHE_TYPE_V`, `LLAMA_ARG_N_PARALLEL` | Attention, KV types and single-slot configuration |
+| `LLAMA_ARG_FLASH_ATTN`, `LLAMA_ARG_CACHE_TYPE_K`, `LLAMA_ARG_CACHE_TYPE_V`, `LLAMA_ARG_N_PARALLEL` | Attention, KV types and lane count |
 | `LLAMA_ARG_LOAD_MODE`, `LLAMA_ARG_MMAP`, `LLAMA_ARG_MLOCK` | Model loading; legacy environment options apply before `LOAD_MODE` |
 | `LLAMA_ARG_MMPROJ`, `LLAMA_ARG_MMPROJ_OFFLOAD`, `LLAMA_ARG_IMAGE_MIN_TOKENS`, `LLAMA_ARG_IMAGE_MAX_TOKENS` | Vision |
 | `LLAMA_ARG_UI`, `LLAMA_ARG_STATIC_PATH`, `LLAMA_ARG_KVMEM_SWAP_UI` | UI enabled/disabled, static directory and the swap-status page |
@@ -317,6 +321,13 @@ $env:LLAMA_ARG_API_KEY_FILE = 'C:\config\kvmem-api-keys.txt'
 ```
 
 Enable `--kvmem-trace` (or `KVMEM_TRACE=1`) to emit the structured startup records described below. Without tracing, normal startup messages and errors remain available.
+
+CUDA GDN output normalization and SiLU gating fuse by default for supported F32,
+128-column graphs, including Qwen35 dense. Unsupported patterns keep the existing
+operators. No GGUF conversion is needed. Set `KVMEM_GDN_OUT_FUSION=0` before
+starting the server to disable this fusion; an unset variable or `1` enables it.
+`KVMEM_GDN_OUT_FUSION_TRACE=1` logs fusion dispatches for diagnostics; leave it
+unset for timing. See the [implementation and measurements](docs/gdn-output-fusion.md).
 
 Startup first validates configuration, model/projector/UI files and incompatible
 settings before loading model weights. `KVMEM_STARTUP requested=...` records the
@@ -542,7 +553,7 @@ progress-reporting approach from [PR #9](https://github.com/kvmem/kvmem-llama.cp
 
 - `GET /health`
 - `GET /v1/models`
-- `POST /v1/chat/completions` (sampling, stream, tools, optional images)
+- `POST /v1/chat/completions` (sampling, stream, tools, optional images and videos)
 - `GET /kvmem/swap`, `GET /kvmem/swap/status`, `GET /kvmem/swap/block?id=N` (only with `--kvmem-swap-ui`)
 - `POST /v1/responses` and `POST /responses` (OpenAI Responses, non-streaming and SSE streaming). With `--mmproj`, `input_image.image_url` accepts image URLs or Base64 data URLs through the same vision pipeline as Chat Completions. File IDs are not supported. The per-request `detail` value is ignored; image resolution is controlled by the server's image token settings. `scripts/test_responses_sdk.py` exercises both paths through the official OpenAI Python SDK, whose Responses stream parser is stricter than a hand-rolled client.
 
@@ -559,6 +570,33 @@ On Linux, relative `--api-key-file` paths are resolved from the caller's current
 directory and checked for readability before an existing service is stopped.
 Native TLS is not supported. Stream `usage` includes
 `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens`.
+
+### Video input
+
+Video input requires a matching vision projector (`--mmproj`), a server built
+with `MTMD_VIDEO=ON` and `LLAMA_SUBPROCESS=ON` (both default to `ON`), and
+**ffmpeg and ffprobe on the server's PATH**. Check `ffmpeg -version` and
+`ffprobe -version` in the environment that launches the server. On Windows,
+add the directory containing both executables to PATH and restart the server
+after changing it. This feature is available in current source builds;
+the older v0.16.0-rc3 binaries predate it.
+
+In Chat Completions, send a content item with `"type": "video_url"` and
+`"video_url": {"url": "data:video/mp4;base64,..."}` (or a video URL).
+`GET /props` reports `modalities.video` from the build and loaded projector;
+it does not check whether ffmpeg and ffprobe are installed.
+
+`--video-fps 2` samples at 2 FPS by default. Zero or a negative finite value
+uses the native frame rate, which can greatly increase prompt size; `NaN`
+and infinity are rejected. Longer clips, higher sampling rates and higher
+frame resolution generally need more prompt tokens. Use `--image-max-tokens`
+to limit frame resolution; the exact token count also depends on the model's
+video processing. Start with a low FPS and `--image-max-tokens 512`, as in
+the recommended recipes, then check `usage.prompt_tokens` before raising
+either setting. The full conversation and output must fit the logical
+context (`-c`). Media groups (which can include adjacent frames) must fit
+the GPU working set (`--kvmem-budget`) alongside the sink tokens;
+generation space is allocated separately with `--kvmem-gen-reserve`.
 
 ## Documentation
 

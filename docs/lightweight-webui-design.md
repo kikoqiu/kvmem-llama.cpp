@@ -1,6 +1,6 @@
 # 轻量 Web UI 接入设计
 
-状态：首版已实现并完成本地验证。基于当前 llama.cpp pin `b81c99b` 的 `tools/ui` 和 KVMem 自定义服务。使用和测试命令见 [ui/README.md](../ui/README.md)。
+状态：首版已实现并完成本地验证；当时基于 llama.cpp pin `b81c99b` 的 `tools/ui` 和 KVMem 自定义服务。当前 master 已迁移到 llama.cpp `v0.5.0`。使用和测试命令见 [ui/README.md](../ui/README.md)。
 
 目标是让用户启动 IQ3/IQ4 后直接在浏览器测试文本、思考与图片。复用上游页面组件和静态构建，不移植上游 server 的调度器，也不实现完整 UI 的后端功能。
 

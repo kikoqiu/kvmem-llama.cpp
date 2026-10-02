@@ -52,7 +52,11 @@ int main() {
     parse("-fa", "on"); check(o.flash_attn == LLAMA_FLASH_ATTN_TYPE_ENABLED);
     parse("-fa", "auto"); check(o.flash_attn == LLAMA_FLASH_ATTN_TYPE_AUTO);
     parse("-np", "1");
-    rejects([&] { parse("-np", "2"); });
+    parse("-np", "2"); check(o.parallel == 2);
+    rejects([&] { parse("-np", "0"); });
+    parse("-np", "3"); check(o.parallel == 3);
+    parse("-np", "4"); check(o.parallel == 4);
+    rejects([&] { parse("-np", "5"); });
     rejects([&] { parse("-ub", "0"); });
     rejects([&] { parse("-fa", "invalid"); });
     parse("--load-mode", "mmap+mlock"); check(o.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK);
@@ -128,21 +132,16 @@ int main() {
     }); });
     check(kvmem_config_key("--kvmem-conversations") == "--kvmem-conversations");
     check(kvmem_config_key("--kvmem-conversations-gb") == "--kvmem-conversations-gb");
-    // Request-independent stderr on the default path must stay what
-    // v0.16.0-rc3 printed. The -np rejection is the one message this feature
-    // was tempted to extend; the pointer to --kvmem-conversations belongs in
-    // print_usage, where changed output is expected.
+    // Both parallel aliases accept exactly the supported lane counts.
     for (const char * flag : {"-np", "--parallel"}) {
-        bool threw = false;
-        try {
-            o.parse(flag, [](const char *) { return "2"; });
-        } catch (const std::invalid_argument & e) {
-            threw = true;
-            check(std::string(e.what()) ==
-                  "KVMem supports --parallel 1 only; automatic/multiple slots are not implemented");
+        for (const char * value : {"2", "3", "4"}) {
+            parse(flag, value);
+            check(o.parallel == std::stoi(value));
         }
-        check(threw);
+        rejects([&] { parse(flag, "0"); });
+        rejects([&] { parse(flag, "5"); });
         parse(flag, "1");
+        check(o.parallel == 1);
     }
     std::puts("server options: passed");
 }

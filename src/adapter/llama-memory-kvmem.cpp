@@ -5,6 +5,7 @@
 
 #include "llama-kvmem-batch.h"
 #include "llama-kvmem-capture.h"
+#include "llama-kvmem-execution.h"
 #include "llama-kvmem-factory.h"
 #include "llama-kvmem-hooks.h"
 #include "llama-kvmem-gpu.h"
@@ -41,7 +42,6 @@
 #include <stdexcept>
 #include <thread>
 
-static llama_kvmem_params g_kvmem_params = {};
 
 struct llama_memory_kvmem::GdnReplay {
     struct Group {
@@ -68,6 +68,10 @@ struct llama_memory_kvmem::GdnReplay {
 // a condition variable and an io thread, so both travel as unique_ptr, which is
 // how they are already held.
 struct llama_memory_kvmem::ConvStore {
+    const llama_model * model = nullptr;
+    ggml_type type_k = GGML_TYPE_F16, type_v = GGML_TYPE_F16;
+    uint32_t slots = 0;
+    bool has_mtp = false;
     bool cold = false;
     std::unique_ptr<kvmem::KvMemRuntime> runtime;
     std::unique_ptr<kvmem::RawKvStore>   raw;
@@ -79,6 +83,10 @@ struct llama_memory_kvmem::ConvStore {
     std::unique_ptr<kvmem::RawKvStore>   mtp_raw;
     // Block ids that were GPU-resident at detach, ascending.
     std::vector<uint32_t>                resident;
+};
+
+struct llama_kvmem_store_bundle {
+    std::unique_ptr<llama_memory_kvmem::ConvStore> store;
 };
 
 // Detached stores, keyed by an opaque handle. Handle 0 is the store the
@@ -98,7 +106,38 @@ struct kvmem_conv_pool {
     int32_t next_id = 1;
 };
 
-static kvmem_conv_pool g_conv_pool;
+static thread_local llama_kvmem_execution_state * active_execution = nullptr;
+
+llama_kvmem_execution_state::llama_kvmem_execution_state()
+    : conversations(std::make_unique<kvmem_conv_pool>()), gpu(kvmem_gpu_state_create()) {}
+
+llama_kvmem_execution_state::~llama_kvmem_execution_state() {
+    auto * previous = llama_kvmem_execution_exchange(this);
+    GGML_ASSERT(!memory && !mtp && "free target/draft contexts before their execution state");
+    kvmem_gpu_state_free(gpu);
+    llama_kvmem_execution_exchange(previous);
+}
+
+llama_kvmem_execution_state & kvmem_current_execution() {
+    static llama_kvmem_execution_state legacy;
+    return active_execution ? *active_execution : legacy;
+}
+
+llama_kvmem_execution_state * llama_kvmem_execution_create() {
+    return new llama_kvmem_execution_state;
+}
+
+llama_kvmem_execution_state * llama_kvmem_execution_exchange(llama_kvmem_execution_state * state) {
+    auto * previous = active_execution;
+    active_execution = state;
+    return previous;
+}
+
+void llama_kvmem_execution_free(llama_kvmem_execution_state * state) {
+    if (!state) return;
+    GGML_ASSERT(state != active_execution && "deactivate before freeing execution state");
+    delete state;
+}
 
 // ~KvMemRuntime does not drain start_prefetch's futures; only std::async's
 // blocking future destructor does. truncate_to(0) waits for them first. Every
@@ -116,33 +155,33 @@ static void kvmem_conv_release(std::unique_ptr<llama_memory_kvmem::ConvStore> & 
 }
 
 static void kvmem_conv_pool_unbind(llama_memory_kvmem * mem) {
-    if (g_conv_pool.owner != mem) {
+    if ((*kvmem_current_execution().conversations).owner != mem) {
         return;
     }
-    for (auto & e : g_conv_pool.entries) {
+    for (auto & e : (*kvmem_current_execution().conversations).entries) {
         kvmem_conv_release(e.store);
     }
-    g_conv_pool = kvmem_conv_pool{};
+    (*kvmem_current_execution().conversations) = kvmem_conv_pool{};
 }
 
 static kvmem_conv_pool * kvmem_conv_pool_bind(llama_memory_kvmem * mem) {
     if (!mem) {
         return nullptr;
     }
-    if (g_conv_pool.owner != mem) {
+    if ((*kvmem_current_execution().conversations).owner != mem) {
         // Reached only if a second memory object arms while an earlier one
         // still holds detached bundles. Release them the way destroy and
         // unbind do rather than dropping them where they lie; unbind() leaves
         // the pool freshly default-constructed.
-        kvmem_conv_pool_unbind(g_conv_pool.owner);
-        g_conv_pool.owner = mem;
-        g_conv_pool.entries.emplace_back();
+        kvmem_conv_pool_unbind((*kvmem_current_execution().conversations).owner);
+        (*kvmem_current_execution().conversations).owner = mem;
+        (*kvmem_current_execution().conversations).entries.emplace_back();
     }
-    return &g_conv_pool;
+    return &(*kvmem_current_execution().conversations);
 }
 
 static kvmem_conv_entry * kvmem_conv_find(int32_t id) {
-    for (auto & e : g_conv_pool.entries) {
+    for (auto & e : (*kvmem_current_execution().conversations).entries) {
         if (e.id == id) {
             return &e;
         }
@@ -425,14 +464,14 @@ static bool kvmem_env_perf() {
 
 void llama_kvmem_set_params(const struct llama_kvmem_params * params) {
     if (params) {
-        g_kvmem_params = *params;
+        kvmem_current_execution().params = *params;
     } else {
-        g_kvmem_params = {};
+        kvmem_current_execution().params = {};
     }
 }
 
 const struct llama_kvmem_params * llama_kvmem_get_params(void) {
-    return &g_kvmem_params;
+    return &kvmem_current_execution().params;
 }
 
 static uint32_t kvmem_align_tokens(uint32_t tokens, uint32_t block_tokens) {
@@ -473,7 +512,7 @@ static kvmem::KvMemRuntimeConfig make_runtime_cfg(
     cfg.store.block_tokens = block_tokens;
     cfg.store.select_budget = budget;
     cfg.store.prefill_budget = budget;
-    cfg.store.select_method = g_kvmem_params.method == 1
+    cfg.store.select_method = kvmem_current_execution().params.method == 1
         ? kvmem::KvMemMethod::Retrieval
         : kvmem::KvMemMethod::Recency;
     cfg.store.sink_blocks = sink_tokens == 0
@@ -481,18 +520,18 @@ static kvmem::KvMemRuntimeConfig make_runtime_cfg(
         : std::max(1u, sink_tokens / block_tokens);
     cfg.store.recent_blocks = recent_tokens / block_tokens;
     cfg.store.gen_budget = 0;
-    cfg.store.gpu_memory_ratio = kvmem_default_ratio(g_kvmem_params.gpu_memory_ratio, 0.50);
-    cfg.store.gpu_high_watermark = kvmem_default_ratio(g_kvmem_params.gpu_high_watermark, 0.95);
-    cfg.store.gpu_low_watermark = kvmem_default_ratio(g_kvmem_params.gpu_low_watermark, 0.85);
+    cfg.store.gpu_memory_ratio = kvmem_default_ratio(kvmem_current_execution().params.gpu_memory_ratio, 0.50);
+    cfg.store.gpu_high_watermark = kvmem_default_ratio(kvmem_current_execution().params.gpu_high_watermark, 0.95);
+    cfg.store.gpu_low_watermark = kvmem_default_ratio(kvmem_current_execution().params.gpu_low_watermark, 0.85);
     cfg.store.estimated_block_bytes = block_bytes;
     cfg.store.gpu_resident_block_bytes = block_bytes;
-    cfg.cpu_bytes = g_kvmem_params.cpu_bytes;
+    cfg.cpu_bytes = kvmem_current_execution().params.cpu_bytes;
     // GPU-block NVMe spill is separate from raw-K NVMe. When raw-K owns the
     // SSD budget, skip the 2 MiB GPU-format copies (V already lives in raw).
-    if (!g_kvmem_params.raw_k_nvme) {
-        cfg.nvme_bytes = g_kvmem_params.nvme_bytes;
-        if (g_kvmem_params.nvme_dir && g_kvmem_params.nvme_dir[0]) {
-            cfg.nvme_dir = g_kvmem_params.nvme_dir;
+    if (!kvmem_current_execution().params.raw_k_nvme) {
+        cfg.nvme_bytes = kvmem_current_execution().params.nvme_bytes;
+        if (kvmem_current_execution().params.nvme_dir && kvmem_current_execution().params.nvme_dir[0]) {
+            cfg.nvme_dir = kvmem_current_execution().params.nvme_dir;
         } else if (cfg.nvme_bytes > 0) {
             cfg.nvme_dir = "/tmp/kvmem_nvme";
         }
@@ -614,8 +653,8 @@ static kvmem_pool_plan kvmem_compute_pool(
         const llama_cparams & cparams,
         uint32_t borrowed_kv_size = 0) {
     kvmem_pool_plan p;
-    p.block_tokens = g_kvmem_params.block_tokens ? g_kvmem_params.block_tokens : 32u;
-    uint32_t budget = g_kvmem_params.budget;
+    p.block_tokens = kvmem_current_execution().params.block_tokens ? kvmem_current_execution().params.block_tokens : 32u;
+    uint32_t budget = kvmem_current_execution().params.budget;
     if (budget == 0) {
         budget = kvmem_align_tokens(cparams.n_ctx_seq, p.block_tokens);
         if (budget == 0) {
@@ -624,7 +663,7 @@ static kvmem_pool_plan kvmem_compute_pool(
     } else {
         budget = kvmem_align_tokens(budget, p.block_tokens);
     }
-    uint32_t gen_reserve = g_kvmem_params.gen_reserve ? g_kvmem_params.gen_reserve : 256u;
+    uint32_t gen_reserve = kvmem_current_execution().params.gen_reserve ? kvmem_current_execution().params.gen_reserve : 256u;
     gen_reserve = kvmem_align_tokens(gen_reserve, p.block_tokens);
 
     const uint32_t il0 = kvmem_first_attn_layer(model);
@@ -635,7 +674,7 @@ static kvmem_pool_plan kvmem_compute_pool(
     const uint64_t v_row = ggml_row_size(params.type_v, n_embd_v);
     p.block_bytes = static_cast<uint64_t>(n_attn) * (k_row + v_row) * p.block_tokens;
 
-    const double ratio = kvmem_default_ratio(g_kvmem_params.gpu_memory_ratio, 0.50);
+    const double ratio = kvmem_default_ratio(kvmem_current_execution().params.gpu_memory_ratio, 0.50);
     p.gpu_total = kvmem_first_gpu_total_bytes();
     if (p.gpu_total > 0 && p.block_bytes > 0 && ratio > 0.0) {
         // This cap only sees total VRAM. Harvest staging and the layout scratch
@@ -661,7 +700,7 @@ static kvmem_pool_plan kvmem_compute_pool(
                 // Match the five FP32 ReplaySSM record widths in llama_memory_recurrent.
                 const uint64_t records = static_cast<uint64_t>(2048 + 6144 + 48 + 48 + 10240) *
                         sizeof(float) * (1 + cparams.n_rs_seq);
-                mtp_state_bytes[dev] += g_kvmem_params.mtp_state == 2 ? state + records : state * (1 + cparams.n_rs_seq);
+                mtp_state_bytes[dev] += kvmem_current_execution().params.mtp_state == 2 ? state + records : state * (1 + cparams.n_rs_seq);
             }
             continue;
         }
@@ -712,7 +751,7 @@ static kvmem_pool_plan kvmem_compute_pool(
         }
         if (cap < 2) throw std::runtime_error("tensor KV pool cannot fit a working block plus generation reserve");
         p.cap_blocks = static_cast<uint32_t>(std::min<uint64_t>(cap, UINT32_MAX));
-        if (g_kvmem_params.budget &&
+        if (kvmem_current_execution().params.budget &&
                 static_cast<uint64_t>(budget) + gen_reserve > cap * p.block_tokens) {
             throw std::runtime_error("requested KVMem budget plus generation reserve exceeds a tensor GPU KV capacity");
         }
@@ -739,7 +778,7 @@ static kvmem_pool_plan kvmem_compute_pool(
         }
         if (cap < 2) throw std::runtime_error("multi-GPU layer KV pool cannot fit a working block plus generation reserve on every owning GPU");
         p.cap_blocks = static_cast<uint32_t>(std::min<uint64_t>(cap, UINT32_MAX));
-        if (g_kvmem_params.budget &&
+        if (kvmem_current_execution().params.budget &&
                 static_cast<uint64_t>(budget) + gen_reserve > cap * p.block_tokens) {
             throw std::runtime_error("requested KVMem budget plus generation reserve exceeds a layer GPU KV capacity");
         }
@@ -752,7 +791,7 @@ static kvmem_pool_plan kvmem_compute_pool(
     }
 
     uint32_t pool = budget + gen_reserve;
-    if (pool > cparams.n_ctx_seq && g_kvmem_params.budget == 0) {
+    if (pool > cparams.n_ctx_seq && kvmem_current_execution().params.budget == 0) {
         pool = cparams.n_ctx_seq;
     }
     if (p.cap_blocks > 0) {
@@ -794,7 +833,7 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams) {
-    if (!g_kvmem_params.enabled) {
+    if (!kvmem_current_execution().params.enabled) {
         return nullptr;
     }
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
@@ -854,7 +893,7 @@ llama_memory_kvmem::llama_memory_kvmem(
     // Both store configs are kept as members so a sibling store for another
     // conversation is configured identically.
     rt_cfg_ = make_runtime_cfg(
-            block_tokens_, pool.budget, g_kvmem_params.sink_tokens, g_kvmem_params.recent_tokens,
+            block_tokens_, pool.budget, kvmem_current_execution().params.sink_tokens, kvmem_current_execution().params.recent_tokens,
             pool.block_bytes);
     rt_cfg_.store.estimated_gpu_block_capacity = pool.cap_blocks;
     runtime_ = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_, &backend_);
@@ -947,12 +986,12 @@ llama_memory_kvmem::llama_memory_kvmem(
     type_k_ = params.type_k;
     type_v_ = params.type_v;
     v_trans_ = !cparams.flash_attn;
-    method_ = g_kvmem_params.method;
-    prefill_method_ = g_kvmem_params.prefill_method;
-    gen_exceed_ = g_kvmem_params.gen_exceed;
-    query_begin_ = g_kvmem_params.query_begin;
-    query_end_ = g_kvmem_params.query_end;
-    force_pos_ = g_kvmem_params.force_pos;
+    method_ = kvmem_current_execution().params.method;
+    prefill_method_ = kvmem_current_execution().params.prefill_method;
+    gen_exceed_ = kvmem_current_execution().params.gen_exceed;
+    query_begin_ = kvmem_current_execution().params.query_begin;
+    query_end_ = kvmem_current_execution().params.query_end;
+    force_pos_ = kvmem_current_execution().params.force_pos;
     kvmem::RawKvStoreConfig & rcfg = raw_cfg_;
     rcfg.n_layer = n_layer_;
     rcfg.n_embd_k = n_embd_k_;
@@ -965,12 +1004,12 @@ llama_memory_kvmem::llama_memory_kvmem(
     if (!v_trans_) {
         rcfg.v_gpu_row_bytes = ggml_row_size(type_v_, n_embd_v_);
     }
-    if (g_kvmem_params.raw_k_nvme) {
-        rcfg.nvme_bytes = g_kvmem_params.nvme_bytes
-                ? g_kvmem_params.nvme_bytes
+    if (kvmem_current_execution().params.raw_k_nvme) {
+        rcfg.nvme_bytes = kvmem_current_execution().params.nvme_bytes
+                ? kvmem_current_execution().params.nvme_bytes
                 : (32ull * 1024ull * 1024ull * 1024ull);
-        rcfg.nvme_dir = (g_kvmem_params.nvme_dir && g_kvmem_params.nvme_dir[0])
-                ? g_kvmem_params.nvme_dir
+        rcfg.nvme_dir = (kvmem_current_execution().params.nvme_dir && kvmem_current_execution().params.nvme_dir[0])
+                ? kvmem_current_execution().params.nvme_dir
                 : "/tmp/kvmem_nvme";
         rcfg.nvme_file = "kvmem_raw_k.bin";
     }
@@ -994,7 +1033,7 @@ llama_memory_kvmem::llama_memory_kvmem(
             method_ == 1 ? "retrieval" : "recency",
             prefill_method_ == 1 ? "retrieval" : "recency",
             gen_exceed_ == 1 ? "retrieval" : "error",
-            (int) g_kvmem_params.harvest_v,
+            (int) kvmem_current_execution().params.harvest_v,
             ggml_type_name(type_k_), ggml_type_name(type_v_),
             n_embd_k_, kvmem_n_attn_layers(model),
             ext_kv ? " hybrid_attn" : "");
@@ -1121,7 +1160,7 @@ bool llama_memory_kvmem::conv_swap_supported(std::string & reason) const {
     }
     // Each RawKvStore opens its own arena, sized for one conversation and named
     // by a fixed nvme_file.
-    if (g_kvmem_params.raw_k_nvme) {
+    if (kvmem_current_execution().params.raw_k_nvme) {
         reason = "raw_k_nvme";
         return false;
     }
@@ -1155,9 +1194,23 @@ bool llama_memory_kvmem::conv_can_drain(std::string & reason) const {
     return true;
 }
 
+bool llama_memory_kvmem::conv_compatible(const llama_memory_kvmem & other) const {
+    return &model_ == &other.model_ && kv_->type_k() == other.kv_->type_k() &&
+        kv_->type_v() == other.kv_->type_v() && n_slots_ == other.n_slots_ &&
+        (mtp_ != nullptr) == (other.mtp_ != nullptr) &&
+        rt_cfg_.store.block_tokens == other.rt_cfg_.store.block_tokens &&
+        rt_cfg_.store.select_budget == other.rt_cfg_.store.select_budget &&
+        rt_cfg_.cpu_bytes == other.rt_cfg_.cpu_bytes;
+}
+
 std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::make_conv() {
     auto conv = std::make_unique<ConvStore>();
-    conv->runtime = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_, &backend_);
+    conv->model = &model_;
+    conv->type_k = kv_->type_k();
+    conv->type_v = kv_->type_v();
+    conv->slots = n_slots_;
+    conv->has_mtp = mtp_ != nullptr;
+    conv->runtime = std::make_unique<kvmem::KvMemRuntime>(rt_cfg_);
     conv->raw = std::make_unique<kvmem::RawKvStore>(raw_cfg_);
     conv->q_sum.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
     conv->q_count.assign(n_layer_, 0);
@@ -1358,11 +1411,18 @@ std::unique_ptr<llama_memory_kvmem::ConvStore> llama_memory_kvmem::detach_conv()
         mtp_->harvest_flush();
     }
 
+    // Unbind before moving ownership; this validates that the drain finished.
+    runtime_->rebind_backend(nullptr);
     // Nothing from here to the return may throw. Past these two moves this
     // object owns no store at all and swap_conv's drain catch cannot put them
     // back: the move-assignments are noexcept, swap_raw() only waits on the
     // follower's io thread and fills a vector it sized at construction, and
     // reset_turn_policy() assigns scalars.
+    conv->model = &model_;
+    conv->type_k = kv_->type_k();
+    conv->type_v = kv_->type_v();
+    conv->slots = n_slots_;
+    conv->has_mtp = mtp_ != nullptr;
     conv->runtime = std::move(runtime_);
     conv->raw = std::move(raw_);
     // One statement after the trunk's own mirror, the way truncate_cached()
@@ -1400,6 +1460,7 @@ bool llama_memory_kvmem::attach_conv(std::unique_ptr<ConvStore> conv) {
     row_positions_ = std::move(conv->row_positions);
     q_sum_ = std::move(conv->q_sum);
     q_count_ = std::move(conv->q_count);
+    runtime_->rebind_backend(&backend_);
     if (q_sum_.size() != n_layer_ || q_count_.size() != n_layer_) {
         q_sum_.assign(n_layer_, std::vector<float>(n_head_ * n_embd_head_, 0.0f));
         q_count_.assign(n_layer_, 0);
@@ -1618,6 +1679,13 @@ void llama_memory_kvmem::conv_reset_to_empty(const char * what) noexcept {
 bool llama_memory_kvmem::swap_conv(std::unique_ptr<ConvStore> & conv) {
     if (!conv) {
         return false;
+    }
+    if (conv->model != &model_ || conv->type_k != kv_->type_k() || conv->type_v != kv_->type_v() ||
+            conv->slots != n_slots_ || conv->has_mtp != (mtp_ != nullptr) ||
+            conv->runtime->config().store.block_tokens != rt_cfg_.store.block_tokens ||
+            conv->runtime->config().store.select_budget != rt_cfg_.store.select_budget ||
+            conv->runtime->config().cpu_bytes != rt_cfg_.cpu_bytes) {
+        throw std::invalid_argument("incompatible conversation bundle");
     }
     std::string reason;
     if (!conv_can_drain(reason)) {
@@ -2561,6 +2629,32 @@ bool llama_memory_kvmem::capture_can_reuse(uint32_t n_tokens, uint32_t n_pos,
     const bool need_q = want_q_capture() &&
             llama_kvmem_ubatch_needs_q_capture(n_tokens, n_pos, pos);
     return need_q == graph_has_q_;
+}
+
+uint64_t llama_memory_kvmem::capture_stamp() const {
+    uint64_t stamp = 1;
+    if (retrieval_pinned_) {
+        stamp |= 2;
+    }
+    if (want_decode_mean()) {
+        stamp |= 4;
+    }
+    if (want_q_capture()) {
+        stamp |= 8;
+    }
+    if (replay_) {
+        stamp |= 16;
+    }
+    if (graph_has_k_) {
+        stamp |= 32;
+    }
+    if (graph_has_q_) {
+        stamp |= 64;
+    }
+    if (graph_has_record_) {
+        stamp |= 128;
+    }
+    return stamp;
 }
 
 bool llama_memory_kvmem::d2h_init() {
@@ -5305,9 +5399,9 @@ llama_pos llama_kvmem_recr_pos_max(void) {
 }
 
 void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos) {
-    g_kvmem_params.query_begin = query_begin;
-    g_kvmem_params.query_end = query_end;
-    g_kvmem_params.force_pos = force_pos;
+    kvmem_current_execution().params.query_begin = query_begin;
+    kvmem_current_execution().params.query_end = query_end;
+    kvmem_current_execution().params.force_pos = force_pos;
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->set_query_span(query_begin, query_end);
         mem->set_force_pos(force_pos);
@@ -5441,6 +5535,68 @@ bool llama_kvmem_store_swap_supported(void) {
     return mem->conv_swap_supported(reason);
 }
 
+bool llama_kvmem_store_compatible_with_execution(const llama_kvmem_execution_state * other) {
+    auto * mem = kvmem_capture_active();
+    return mem && other && other->memory && mem->conv_compatible(*other->memory);
+}
+
+llama_kvmem_store_bundle * llama_kvmem_store_bundle_create() {
+    auto * mem = kvmem_capture_active();
+    std::string reason;
+    if (!mem || !mem->conv_swap_supported(reason)) {
+        throw std::runtime_error("portable conversation bundles require flash attention and host KV");
+    }
+    auto result = std::make_unique<llama_kvmem_store_bundle>();
+    result->store = mem->make_conv();
+    return result.release();
+}
+
+void llama_kvmem_store_bundle_free(llama_kvmem_store_bundle * bundle) {
+    delete bundle;
+}
+
+bool llama_kvmem_store_bundle_swap(llama_kvmem_store_bundle * bundle) {
+    auto * mem = kvmem_capture_active();
+    if (!mem || !bundle || !bundle->store) {
+        throw std::invalid_argument("missing portable conversation bundle");
+    }
+    return mem->swap_conv(bundle->store);
+}
+
+uint32_t llama_kvmem_store_bundle_rows(const llama_kvmem_store_bundle * bundle) {
+    return bundle && bundle->store && bundle->store->runtime
+        ? bundle->store->runtime->store().total_tokens() : 0;
+}
+
+void llama_kvmem_store_bundle_reset(llama_kvmem_store_bundle * bundle) {
+    if (!bundle || !bundle->store) throw std::invalid_argument("missing portable conversation bundle");
+    auto & store = *bundle->store;
+    store.runtime->truncate_to(0);
+    store.raw->truncate_to(0);
+    if (store.mtp_raw) store.mtp_raw->truncate_to(0);
+    store.row_positions.clear();
+    store.resident.clear();
+    for (auto & sum : store.q_sum) std::fill(sum.begin(), sum.end(), 0.0f);
+    std::fill(store.q_count.begin(), store.q_count.end(), 0);
+}
+
+uint64_t llama_kvmem_store_active_bytes() {
+    auto * mem = kvmem_capture_active();
+    return mem ? mem->host_bytes() : 0;
+}
+
+uint64_t llama_kvmem_store_bundle_bytes(const llama_kvmem_store_bundle * bundle) {
+    if (!bundle || !bundle->store) return 0;
+    const auto & store = *bundle->store;
+    uint64_t bytes = store.runtime ? store.runtime->allocated_bytes() : 0;
+    bytes += store.raw ? store.raw->allocated_bytes() : 0;
+    bytes += store.mtp_raw ? store.mtp_raw->allocated_bytes() : 0;
+    bytes += store.row_positions.capacity()*sizeof(store.row_positions.front());
+    bytes += store.resident.capacity()*sizeof(uint32_t) + store.q_count.capacity()*sizeof(uint32_t);
+    for (const auto & sum : store.q_sum) bytes += sizeof(sum) + sum.capacity()*sizeof(float);
+    return bytes;
+}
+
 int32_t llama_kvmem_store_create(void) {
     llama_memory_kvmem * mem = kvmem_capture_active();
     if (!mem) {
@@ -5479,15 +5635,15 @@ int32_t llama_kvmem_store_create(void) {
 
 bool llama_kvmem_store_switch(int32_t store_id) {
     llama_memory_kvmem * mem = kvmem_capture_active();
-    if (!mem || g_conv_pool.owner != mem) {
+    if (!mem || (*kvmem_current_execution().conversations).owner != mem) {
         return false;
     }
-    if (store_id == g_conv_pool.active) {
+    if (store_id == (*kvmem_current_execution().conversations).active) {
         return mem->store_n_tokens() > 0;
     }
     kvmem_conv_entry * in = kvmem_conv_find(store_id);
-    kvmem_conv_entry * out = kvmem_conv_find(g_conv_pool.active);
-    if (!in || !in->store || in->store->cold || (out && out->store) || (!out && g_conv_pool.active != -1)) {
+    kvmem_conv_entry * out = kvmem_conv_find((*kvmem_current_execution().conversations).active);
+    if (!in || !in->store || in->store->cold || (out && out->store) || (!out && (*kvmem_current_execution().conversations).active != -1)) {
         LLAMA_LOG_ERROR("%s: KVMem store %d is not a detached host store\n", __func__, store_id);
         return false;
     }
@@ -5499,7 +5655,7 @@ bool llama_kvmem_store_switch(int32_t store_id) {
     } catch (const std::exception & e) {
         // swap_conv throws only before it hands either bundle over -- out of
         // the drain, or out of the clear it runs when the active store cannot
-        // be drained safely -- so both handles and g_conv_pool.active still
+        // be drained safely -- so both handles and (*kvmem_current_execution().conversations).active still
         // name what they named. Past the handover nothing throws: the attach's
         // repair path is noexcept and reports its failure as false, so this
         // catch can never run with the two bundles already exchanged, which is
@@ -5514,20 +5670,20 @@ bool llama_kvmem_store_switch(int32_t store_id) {
         // LLAMA_API boundary, so nothing may cross it, not only what derives
         // from std::exception.
         LLAMA_LOG_ERROR("%s: KVMem store swap to %d failed (%s); store %d stays active\n",
-                __func__, store_id, e.what(), (int) g_conv_pool.active);
+                __func__, store_id, e.what(), (int) (*kvmem_current_execution().conversations).active);
         return false;
     } catch (...) {
         LLAMA_LOG_ERROR("%s: KVMem store swap to %d failed; store %d stays active\n",
-                __func__, store_id, (int) g_conv_pool.active);
+                __func__, store_id, (int) (*kvmem_current_execution().conversations).active);
         return false;
     }
     // swap_conv leaves the outgoing conversation in the handle it was given.
     const int32_t out_id = out ? out->id : -1;
     if (out) out->store = std::move(in->store);
     else kvmem_conv_release(in->store); // temporary empty execution store
-    g_conv_pool.active = store_id;
+    (*kvmem_current_execution().conversations).active = store_id;
     kvmem_diag("KVMEM_STORE_SWAP out=%d in=%d n_stores=%zu out_rows=%u in_rows=%u restaged=%d ms=%.2f\n",
-            out_id, store_id, g_conv_pool.entries.size(), out_rows, mem->store_n_tokens(),
+            out_id, store_id, (*kvmem_current_execution().conversations).entries.size(), out_rows, mem->store_n_tokens(),
             (int) restaged, (ggml_time_us() - t0) / 1000.0);
     return restaged;
 }
@@ -5537,21 +5693,21 @@ int32_t llama_kvmem_store_current(void) {
     if (!mem) {
         return -1;
     }
-    return g_conv_pool.owner == mem ? g_conv_pool.active : 0;
+    return (*kvmem_current_execution().conversations).owner == mem ? (*kvmem_current_execution().conversations).active : 0;
 }
 
 bool llama_kvmem_store_destroy(int32_t store_id) {
     llama_memory_kvmem * mem = kvmem_capture_active();
-    if (!mem || g_conv_pool.owner != mem || store_id == g_conv_pool.active) {
+    if (!mem || (*kvmem_current_execution().conversations).owner != mem || store_id == (*kvmem_current_execution().conversations).active) {
         return false;
     }
-    for (auto it = g_conv_pool.entries.begin(); it != g_conv_pool.entries.end(); ++it) {
+    for (auto it = (*kvmem_current_execution().conversations).entries.begin(); it != (*kvmem_current_execution().conversations).entries.end(); ++it) {
         if (it->id != store_id) {
             continue;
         }
         kvmem_conv_release(it->store);
-        g_conv_pool.entries.erase(it);
-        kvmem_diag("KVMEM_STORE_DESTROY id=%d n_stores=%zu\n", store_id, g_conv_pool.entries.size());
+        (*kvmem_current_execution().conversations).entries.erase(it);
+        kvmem_diag("KVMEM_STORE_DESTROY id=%d n_stores=%zu\n", store_id, (*kvmem_current_execution().conversations).entries.size());
         return true;
     }
     return false;
@@ -5562,10 +5718,10 @@ uint32_t llama_kvmem_store_rows(int32_t store_id) {
     if (!mem) {
         return 0;
     }
-    if (g_conv_pool.owner != mem) {
+    if ((*kvmem_current_execution().conversations).owner != mem) {
         return store_id == 0 ? mem->store_n_tokens() : 0;
     }
-    if (store_id == g_conv_pool.active) {
+    if (store_id == (*kvmem_current_execution().conversations).active) {
         return mem->store_n_tokens();
     }
     const kvmem_conv_entry * e = kvmem_conv_find(store_id);
@@ -5577,11 +5733,11 @@ uint64_t llama_kvmem_store_bytes(int32_t store_id) {
     if (!mem) {
         return 0;
     }
-    const bool pooled = g_conv_pool.owner == mem;
+    const bool pooled = (*kvmem_current_execution().conversations).owner == mem;
     if (!pooled) {
         return store_id == 0 ? mem->host_bytes() : 0;
     }
-    if (store_id == g_conv_pool.active) {
+    if (store_id == (*kvmem_current_execution().conversations).active) {
         return mem->host_bytes();
     }
     const kvmem_conv_entry * e = kvmem_conv_find(store_id);
@@ -5591,14 +5747,14 @@ uint64_t llama_kvmem_store_bytes(int32_t store_id) {
 bool llama_kvmem_store_park() {
     auto * mem = kvmem_capture_active();
     if (!mem || !kvmem_conv_pool_bind(mem)) return false;
-    if (g_conv_pool.active == -1) return true;
-    auto * out = kvmem_conv_find(g_conv_pool.active);
+    if ((*kvmem_current_execution().conversations).active == -1) return true;
+    auto * out = kvmem_conv_find((*kvmem_current_execution().conversations).active);
     if (!out || out->store) return false;
     try {
         auto empty = mem->make_conv();
         mem->swap_conv(empty);
         out->store = std::move(empty);
-        g_conv_pool.active = -1;
+        (*kvmem_current_execution().conversations).active = -1;
         return true;
     } catch (const std::exception & e) {
         LLAMA_LOG_ERROR("KVMEM session park failed: %s\n", e.what());
@@ -5607,7 +5763,7 @@ bool llama_kvmem_store_park() {
 }
 
 static llama_memory_kvmem::ConvStore & kvmem_detached(int32_t id) {
-    if (g_conv_pool.owner != kvmem_capture_active() || id == g_conv_pool.active)
+    if ((*kvmem_current_execution().conversations).owner != kvmem_capture_active() || id == (*kvmem_current_execution().conversations).active)
         throw std::runtime_error("session snapshot requires a detached store");
     auto * e = kvmem_conv_find(id);
     if (!e || !e->store) throw std::runtime_error("unknown detached session store");

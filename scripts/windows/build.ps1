@@ -7,6 +7,7 @@ param(
     [switch]$ExperimentalCuda129,
     [switch]$Vulkan,
     [string]$CudaArchitectures = '75-real;80-real;86-real;89-real;90-real;120a-real',
+    [ValidateSet('Release', 'Debug', 'RelWithDebInfo', 'MinSizeRel')][string]$BuildType = 'Release',
     [ValidateRange(1, 64)][int]$Jobs = 4,
     [switch]$HostOnly,
     [switch]$BuildOnly
@@ -33,30 +34,80 @@ function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     if ($LASTEXITCODE -ne 0) { throw "$Program failed with exit code $LASTEXITCODE" }
 }
 foreach ($tool in 'cmake', 'ninja', 'cl') { $null = Get-Command $tool -ErrorAction Stop }
+# Prefer English diagnostics; installations without English resources use a local language.
+$env:VSLANG = '1033'
+$null = New-Item -ItemType Directory -Path $BuildDir -Force
+$probeSource = Join-Path $BuildDir 'kvmem-msvc-probe.c'
+$probeHeader = Join-Path $BuildDir 'kvmem-msvc-probe.h'
+$probeObject = Join-Path $BuildDir 'kvmem-msvc-probe.obj'
+[IO.File]::WriteAllText($probeSource, '#include "kvmem-msvc-probe.h"')
+[IO.File]::WriteAllText($probeHeader, '')
+$probeLines = & cl /nologo /showIncludes /c $probeSource "/Fo$probeObject" 2>&1
+if ($LASTEXITCODE -ne 0) { throw "MSVC include-prefix probe failed: $probeLines" }
+$includePrefix = $null
+foreach ($line in $probeLines) {
+    if ("$line" -match '^(.+?)[A-Za-z]:[\\/].*kvmem-msvc-probe\.h$') {
+        $includePrefix = $Matches[1].TrimEnd() + ' '
+        break
+    }
+}
+if (!$includePrefix) { throw 'Cannot detect the MSVC include dependency prefix' }
+$resetCppDependencies = $false
+$ninjaRules = Join-Path $BuildDir 'CMakeFiles/rules.ninja'
+if (Test-Path -LiteralPath $ninjaRules) {
+    $previousPrefix = [regex]::Match([IO.File]::ReadAllText($ninjaRules), '(?m)^msvc_deps_prefix = (.*)$')
+    if ($previousPrefix.Success) {
+        $resetCppDependencies = $previousPrefix.Groups[1].Value.TrimEnd() -ne $includePrefix.TrimEnd()
+    }
+}
+$rulesOverride = Join-Path $BuildDir 'kvmem-msvc-rules.cmake'
+$escapedPrefix = $includePrefix.Replace('\', '\\').Replace('"', '\"')
+[IO.File]::WriteAllText($rulesOverride, "set(CMAKE_CL_SHOWINCLUDES_PREFIX `"$escapedPrefix`")`n", [Text.UTF8Encoding]::new($false))
+
 
 if (!$HostOnly) {
-    # Use the maintained patch, never the developer's unrecorded submodule edits.
+    # Use the maintained patches, never the developer's unrecorded submodule edits.
     $llama = Join-Path $SourceDir 'llama.cpp'
     $patch = Join-Path $SourceDir 'patches/llama-kvmem-current.patch'
-    $savedPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = 'Continue'
-        & git -C $llama apply --reverse --check $patch 2>$null
-        $applied = $LASTEXITCODE -eq 0
-    } finally { $ErrorActionPreference = $savedPreference }
-    if (!$applied) {
-        Invoke-Checked git @('-C', $llama, 'apply', '--check', $patch)
-        Invoke-Checked git @('-C', $llama, 'apply', $patch)
+    $graph = Join-Path $SourceDir 'patches/cuda-graph-decode.patch'
+    $gdnOutput = Join-Path $SourceDir 'patches/gdn-output-fusion.patch'
+    $graphReactivation = Join-Path $SourceDir 'patches/cuda-graph-reactivation.patch'
+    function Test-PatchApplied([string]$PatchPath) {
+        $savedPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & git -C $llama apply --ignore-space-change --reverse --check $PatchPath 2>$null
+            return $LASTEXITCODE -eq 0
+        } finally { $ErrorActionPreference = $savedPreference }
+    }
+    # The graph patch sits on the cumulative patch, so a tree with both applied
+    # no longer reverses the cumulative patch alone.
+    if (!(Test-PatchApplied $gdnOutput) -and !(Test-PatchApplied $graph)) {
+        if (!(Test-PatchApplied $patch)) {
+            Invoke-Checked git @('-C', $llama, 'apply', '--check', $patch)
+            Invoke-Checked git @('-C', $llama, 'apply', $patch)
+        }
+        Invoke-Checked git @('-C', $llama, 'apply', '--check', $graph)
+        Invoke-Checked git @('-C', $llama, 'apply', $graph)
+    }
+    if (!(Test-PatchApplied $gdnOutput)) {
+        Invoke-Checked git @('-C', $llama, 'apply', '--ignore-space-change', '--check', $gdnOutput)
+        Invoke-Checked git @('-C', $llama, 'apply', '--ignore-space-change', $gdnOutput)
+    }
+    if (!(Test-PatchApplied $graphReactivation)) {
+        Invoke-Checked git @('-C', $llama, 'apply', '--check', $graphReactivation)
+        Invoke-Checked git @('-C', $llama, 'apply', $graphReactivation)
     }
 }
 $options = @('-S', $SourceDir, '-B', $BuildDir, '-G', 'Ninja',
-    '-DCMAKE_BUILD_TYPE=Release', '-DCMAKE_CXX_COMPILER=cl',
+    "-DCMAKE_BUILD_TYPE=$BuildType", '-DCMAKE_CXX_COMPILER=cl',
+    "-DCMAKE_USER_MAKE_RULES_OVERRIDE=$rulesOverride",
     '-DBUILD_SHARED_LIBS=OFF', '-DKVMEM_ENABLE_NVME=OFF')
 if (!$HostOnly) {
     $options += @('-DCMAKE_C_COMPILER=cl', '-DGGML_BACKEND_DL=OFF',
     '-DGGML_NATIVE=OFF', '-DGGML_AVX=ON', '-DGGML_AVX2=ON', '-DGGML_FMA=ON',
     '-DGGML_F16C=ON', '-DGGML_BMI2=ON', '-DGGML_AVX512=OFF',
-    '-DGGML_CUDA_FA_ALL_QUANTS=ON')
+    '-DGGML_CUDA_FA_QUANTS=all')
 }
 if ($HostOnly) {
     $options += '-DKVMEM_BUILD_LLAMA=OFF'
@@ -90,17 +141,27 @@ if ($HostOnly) {
     }
 }
 Invoke-Checked cmake $options
-$targets = @('kvmem_store_test', 'pinned_kv_tier_test',
+if ($resetCppDependencies) {
+    Write-Host 'MSVC dependency prefix changed; rebuilding C/C++ objects to record valid include dependencies.'
+    foreach ($object in Get-ChildItem -LiteralPath $BuildDir -Recurse -File -Filter '*.obj') {
+        if ($object.Name -like '*.cu.obj') { continue }
+        if (!$object.FullName.StartsWith($BuildDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'Object path is outside the build directory'
+        }
+        Remove-Item -LiteralPath $object.FullName
+    }
+}
+$targets = @('backend_rebind_test', 'kvmem-lane-pool-test', 'kvmem_store_test', 'pinned_kv_tier_test',
     'kvmem-conversation-store-test', 'kvmem-session-snapshot-test',
     'kvmem-session-transfer-test', 'kvmem-session-cache-lifecycle-worker')
 if (!$HostOnly) {
     $targets += @('llama-kvmem-server', 'llama-kvmem-cli', 'llama-quantize',
         'kvmem-chat-id-test', 'kvmem-reasoning-budget-test', 'kvmem-chat-template-test', 'kvmem-server-options-test',
-        'kvmem-server-progress-test', 'kvmem-output-limit-test', 'kvmem-responses-test')
+        'kvmem-server-progress-test', 'kvmem-output-limit-test', 'kvmem-responses-test', 'kvmem-gdn-output-fusion-test')
 }
 Invoke-Checked cmake (@('--build', $BuildDir, '--parallel', "$Jobs", '--target') + $targets)
 if (!$BuildOnly) {
     Invoke-Checked ctest @('--test-dir', $BuildDir, '--output-on-failure', '-R',
-        '^(kvmem_store_test|pinned_kv_tier_test|kvmem-conversation-store-test|kvmem-session-snapshot-test|kvmem-session-transfer-test|kvmem-session-cache-lifecycle-test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test|kvmem-responses-test)$')
+        '^(backend_rebind_test|kvmem-lane-pool-test|kvmem_store_test|pinned_kv_tier_test|kvmem-conversation-store-test|kvmem-session-snapshot-test|kvmem-session-transfer-test|kvmem-session-cache-lifecycle-test|kvmem-chat-id-test|kvmem-reasoning-budget-test|kvmem-chat-template-test|kvmem-server-options-test|kvmem-server-progress-test|kvmem-output-limit-test|kvmem-responses-test|kvmem-gdn-output-fusion-test)$')
     Write-Host "Built and tested: $BuildDir"
 } else { Write-Host "Built only; runtime tests NOT run: $BuildDir" }
