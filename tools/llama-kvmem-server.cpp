@@ -167,7 +167,9 @@ static void print_usage(const char * argv0) {
             "  --reasoning-budget-message MSG  injected before forced </think> (default none)\n"
             "  --webui                    serve bundled chat UI (default on)\n"
             "  --kvmem-swap-ui            serve the swap-status page on /kvmem/swap (default off)\n"
-            "  --no-kvmem-swap-ui         disable the swap-status page (default)\n",
+            "  --no-kvmem-swap-ui         disable the swap-status page (default)\n"
+            "  --kvmem-protect-system     keep this request's system prompt resident (default on)\n"
+            "  --no-kvmem-protect-system  let the system prompt compete for retrieval slots\n",
             argv0);
 }
 
@@ -312,6 +314,7 @@ struct ServerState {
     kvmem_server_progress progress;
     kvmem_server_log log;
     bool swap_ui = false; // --kvmem-swap-ui: serve /kvmem/swap
+    bool protect_system = true; // --kvmem-protect-system: pin this request's system prompt
     kvmem_swap_publisher swap_pub;
     llama_model * model = nullptr;
     llama_context * ctx = nullptr;
@@ -1790,6 +1793,87 @@ static std::vector<llama_kvmem_row_range> collect_user_spans(const ServerState &
     return spans;
 }
 
+// End row (exclusive) of the leading system prompt of the rendered prompt.
+// Probes, in order: the template's own message delimiters (the autoparser
+// derives the first user start, which is where the system prompt ends), a
+// system-only re-render for templates that allow a prompt without a user
+// turn, then a ChatML delimiter probe. Zero when the chat has no leading
+// system message. When a system message exists but no probe locates it, warn
+// once: the prompt stays unpinned.
+static int derive_system_end(const ServerState & st, const kvmem_prompt & prompt,
+                             const common_chat_params & params,
+                             const common_chat_templates_inputs & inputs, int eval_end) {
+    const bool has_system = !inputs.messages.empty() &&
+            (inputs.messages.front().role == "system" ||
+             inputs.messages.front().role == "developer");
+    if (!has_system) {
+        return 0; // no system message: nothing to protect, not a failure
+    }
+
+    // 1. Template-correct delimiters: the first user message starts where the
+    //    system prompt ends.
+    common_chat_msg_delimiters delims = params.message_delimiters;
+    if (!delims.delimiters.empty()) {
+        delims.tokenize(st.vocab);
+        for (const auto & d : delims.delimiters) {
+            if (d.role != COMMON_CHAT_ROLE_USER || d.tokens.empty()) {
+                continue;
+            }
+            for (size_t i = 0; i + d.tokens.size() <= prompt.tokens.size(); ++i) {
+                if (std::equal(d.tokens.begin(), d.tokens.end(), prompt.tokens.begin() + i)) {
+                    return std::min((int) i, eval_end);
+                }
+            }
+        }
+    }
+
+    // 2. Re-render with only the leading system messages, for templates that
+    //    allow a prompt without a user turn.
+    {
+        common_chat_templates_inputs sys_inputs = inputs;
+        size_t n_sys = 0;
+        for (const auto & m : inputs.messages) {
+            if (m.role != "system" && m.role != "developer") {
+                break;
+            }
+            ++n_sys;
+        }
+        sys_inputs.messages.assign(inputs.messages.begin(), inputs.messages.begin() + n_sys);
+        sys_inputs.add_generation_prompt = false;
+        std::string prefix;
+        try {
+            prefix = common_chat_templates_apply(st.tmpls.get(), sys_inputs).prompt;
+        } catch (const std::exception &) {
+            prefix.clear();
+        }
+        if (!prefix.empty() && params.prompt.compare(0, prefix.size(), prefix) == 0) {
+            return std::min((int) tokenize_text(st.vocab, prefix, true).size(), eval_end);
+        }
+    }
+
+    // 3. ChatML delimiter probe, the shape the user-span derivation assumes.
+    {
+        common_chat_msg_delimiters delimiters;
+        delimiters.add(COMMON_CHAT_ROLE_SYSTEM, "<|im_start|>system");
+        delimiters.add(COMMON_CHAT_ROLE_UNKNOWN, "<|im_end|>");
+        delimiters.tokenize(st.vocab);
+        for (const auto & span : prompt.message_spans(delimiters).spans) {
+            if (span.role == COMMON_CHAT_ROLE_SYSTEM) {
+                return std::min((int) (span.pos + span.len) +
+                                (int) delimiters.delimiters.back().tokens.size(), eval_end);
+            }
+        }
+    }
+
+    static bool warned = false;
+    if (!warned) {
+        warned = true;
+        LOG_WRN("srv    kvmem protect-system: cannot locate the system prompt for this "
+                "chat template; system prompt not pinned\n");
+    }
+    return 0;
+}
+
 struct ChatRequest {
     std::vector<common_chat_msg> msgs;
     std::vector<common_chat_tool> tools;
@@ -2633,6 +2717,7 @@ int main(int argc, char ** argv) {
     }
     st.kparams.sink_tokens = static_cast<uint32_t>(options.sink_tokens);
     st.swap_ui = options.swap_ui;
+    st.protect_system = options.protect_system;
     // Cross-checks on the two new flags, thrown so they reach the
     // "invalid arguments (source=...)" printer below the way every other
     // rejection here does. Neither can fire without one of the flags, so the
@@ -3403,6 +3488,19 @@ int main(int argc, char ** argv) {
         st.kparams.force_pos = force;
         if (st.kparams.enabled) {
             llama_kvmem_set_request_span(qbegin, qend, force);
+        }
+        if (st.kparams.enabled) {
+            // Per request, pin this prompt's system-prompt rows so retrieval
+            // cannot swap them out. Recomputed every request, never global.
+            const int eval_end = (int) toks.size() - (st.spec.ok ? 1 : 0);
+            const int protect_end = st.protect_system
+                    ? derive_system_end(st, *parsed_prompt, formatted, inputs, eval_end) : 0;
+            llama_kvmem_set_protect_prefix(protect_end);
+            if (st.protect_system) {
+                const int block = st.kparams.block_tokens ? (int) st.kparams.block_tokens : 128;
+                kvmem_diag("KVMEM_TRACE protect_system end=%d blocks=%d\n",
+                        protect_end, protect_end > 0 ? (protect_end + block - 1) / block : 0);
+            }
         }
         if (st.kparams.enabled && st.kparams.prefill_method == 1) {
             // Prefill pressure scores against the newest user span that has

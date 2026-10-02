@@ -1039,6 +1039,10 @@ void llama_memory_kvmem::reset_turn_policy() {
     explicit_spans_ = false;
     query_frozen_ = false;
     turn_spans_ = {};
+    protect_prefix_end_ = -1;
+    if (runtime_) {
+        runtime_->store().set_runtime_sink_blocks(0);
+    }
     retrieval_pinned_ = false;
     keep_selected_ = false;
     prefill_capture_ = true;
@@ -4381,6 +4385,19 @@ void llama_memory_kvmem::retr_perf_print() {
             retr_.n_move, retr_.n_raw, retr_.n_skip, retr_.n_stage_in, retr_.laid_out);
 }
 
+void llama_memory_kvmem::set_protect_prefix(int32_t end_row) {
+    harvest_flush();
+    protect_prefix_end_ = end_row;
+    if (!runtime_) {
+        return;
+    }
+    uint32_t blocks = 0;
+    if (end_row > 0 && block_tokens_ > 0) {
+        blocks = static_cast<uint32_t>((end_row + block_tokens_ - 1) / block_tokens_);
+    }
+    runtime_->store().set_runtime_sink_blocks(blocks);
+}
+
 void llama_memory_kvmem::set_turn_spans(const llama_kvmem_turn_spans & spans) {
     for (const auto & ranges : {spans.query, spans.mandatory}) {
         for (const auto & r : ranges) {
@@ -5294,6 +5311,12 @@ void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_
     if (llama_memory_kvmem * mem = kvmem_capture_active()) {
         mem->set_query_span(query_begin, query_end);
         mem->set_force_pos(force_pos);
+    }
+}
+
+void llama_kvmem_set_protect_prefix(int32_t end_row) {
+    if (llama_memory_kvmem * mem = kvmem_capture_active()) {
+        mem->set_protect_prefix(end_row);
     }
 }
 

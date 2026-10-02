@@ -457,6 +457,42 @@ static void test_topk_mandatory_blocks_stay_inside_budget() {
     CHECK(std::find(sel.begin(), sel.end(), 3) == sel.end());
 }
 
+static void test_runtime_sink_protects_request_prefix() {
+    KvMemStoreConfig cfg;
+    cfg.block_tokens = 32;
+    cfg.select_budget = 32 * 4;  // budget = four blocks
+    cfg.sink_blocks = 1;         // configure-time sink
+    cfg.recent_blocks = 0;
+    KvMemStore s(cfg);
+    s.register_append(32 * 12);  // twelve blocks, every score zero
+
+    CHECK(s.sink_blocks() == 1);
+    CHECK(s.runtime_sink_blocks() == 0);
+
+    // Per-request override keeps the whole system prompt; the one free slot
+    // falls to the newest block, so the base policy is otherwise unchanged.
+    s.set_runtime_sink_blocks(3);
+    CHECK(s.runtime_sink_blocks() == 3);
+    CHECK(s.sink_blocks() == 3);
+    const auto selected = s.pick_topk_blocks();
+    CHECK(selected.size() == 4);
+    CHECK(selected[0] == 0 && selected[1] == 1 && selected[2] == 2);
+    CHECK(selected[3] == 11);
+
+    // Over budget clamps to the selection budget.
+    s.set_runtime_sink_blocks(10);
+    CHECK(s.sink_blocks() == 4);
+    const auto clamped = s.pick_topk_blocks();
+    CHECK(clamped.size() == 4);
+    CHECK(clamped[0] == 0 && clamped[3] == 3);
+
+    // A value at or below the configured sink clears the override, so the next
+    // request starts from the base policy again.
+    s.set_runtime_sink_blocks(1);
+    CHECK(s.runtime_sink_blocks() == 0);
+    CHECK(s.sink_blocks() == 1);
+}
+
 static void test_mandatory_overlap_deduplicates_and_recent_is_best_effort() {
     KvMemStoreConfig cfg;
     cfg.block_tokens = 32;
@@ -1206,6 +1242,7 @@ int main() {
     test_topk_zero_recent_keeps_no_suffix();
     test_budget_scaled_keep_allocation();
     test_topk_mandatory_blocks_stay_inside_budget();
+    test_runtime_sink_protects_request_prefix();
     test_mandatory_overlap_deduplicates_and_recent_is_best_effort();
     test_mandatory_hard_union_overflow_trims_newest();
     test_prefill_pressure_mandatory_blocks_stay_inside_budget();

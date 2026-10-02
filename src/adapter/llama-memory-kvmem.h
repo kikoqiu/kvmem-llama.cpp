@@ -104,6 +104,10 @@ public:
     void harvest_capture(struct ggml_tensor * t, int il, char which);
     void apply_retrieval();
     void set_turn_spans(const llama_kvmem_turn_spans & spans);
+    // Per-request always-kept prefix: the rows of this request's system
+    // prompt. The server recomputes it every request, so it is never a global
+    // setting. end_row <= 0 clears it and restores the configured sink.
+    void set_protect_prefix(int32_t end_row);
     // User-message spans of the prompt being prefilled. While a prefill is
     // under pressure the newest already-started span stands in for the request
     // query, which is usually not prefilled yet.
@@ -475,6 +479,7 @@ private:
     int32_t query_begin_ = -1;
     int32_t query_end_ = -1;
     int32_t force_pos_ = -1;
+    int32_t protect_prefix_end_ = -1;
     llama_kvmem_turn_spans turn_spans_;
     bool explicit_spans_ = false;
     bool query_frozen_ = false;

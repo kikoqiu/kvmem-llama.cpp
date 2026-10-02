@@ -72,6 +72,7 @@ struct kvmem_server_options {
     int verbosity = 3; // Same default and levels as llama-server.
     int trace = -1; // -1 inherits KVMEM_TRACE; CLI overrides only after parsing.
     bool swap_ui = false; // --kvmem-swap-ui: serve the swap-status page (default off).
+    bool protect_system = true; // --kvmem-protect-system: keep this request's system prompt resident (default on).
     int threads = -1;
     int threads_batch = -1;
     int ubatch = 0; // Omission preserves the existing batch-size default.
@@ -164,6 +165,8 @@ struct kvmem_server_options {
             sink_tokens = kvmem_cli_int(arg.c_str(), need(arg.c_str()));
         } else if (arg == "--kvmem-swap-ui" || arg == "--no-kvmem-swap-ui") {
             swap_ui = arg == "--kvmem-swap-ui";
+        } else if (arg == "--kvmem-protect-system" || arg == "--no-kvmem-protect-system") {
+            protect_system = arg == "--kvmem-protect-system";
         } else if (arg == "--kvmem-conversations") {
             conversations = kvmem_cli_int(arg.c_str(), need(arg.c_str()), 1);
         } else if (arg == "--kvmem-conversations-gb" || arg == "--kvmem-session-ram-gb") {

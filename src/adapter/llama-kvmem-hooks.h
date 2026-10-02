@@ -157,6 +157,11 @@ LLAMA_API bool llama_kvmem_gdn_replay_begin(llama_pos start, uint32_t width);
 LLAMA_API bool llama_kvmem_gdn_replay_commit(struct llama_context * ctx, uint32_t n_keep);
 // Update query span / force_pos on the live memory (after llama_init_from_model).
 LLAMA_API void llama_kvmem_set_request_span(int32_t query_begin, int32_t query_end, int32_t force_pos);
+// Per-request system-prompt protection: rows [0, end_row) of the current
+// prompt are always kept in the GPU working set. end_row <= 0 clears it and
+// restores the configured sink. The caller sets this every request, so the
+// protection is per message, not a global setting.
+LLAMA_API void llama_kvmem_set_protect_prefix(int32_t end_row);
 // User-message content spans (rows) of the current prompt, ascending. Used as
 // the retrieval query while a prefill is under pressure and the request query
 // is not prefilled yet. Empty list = prefill pressure stays recency.

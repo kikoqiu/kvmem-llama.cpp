@@ -366,6 +366,18 @@ public:
         return runtime_select_budget_;
     }
     void set_runtime_select_budget(uint32_t tokens);
+
+    // Always-kept prefix blocks. A non-zero runtime value overrides the
+    // configured sink for one request without changing the allocation made at
+    // configure time; it never lowers below the configured sink. The adapter
+    // sets it per request to cover the system prompt.
+    uint32_t sink_blocks() const {
+        return runtime_sink_blocks_ != 0 ? runtime_sink_blocks_ : cfg_.sink_blocks;
+    }
+    uint32_t runtime_sink_blocks() const {
+        return runtime_sink_blocks_;
+    }
+    void set_runtime_sink_blocks(uint32_t blocks);
     uint32_t budget_blocks() const {
         return select_budget_tokens() / cfg_.block_tokens;
     }
@@ -498,6 +510,7 @@ public:
 private:
     KvMemStoreConfig cfg_;
     uint32_t runtime_select_budget_ = 0;
+    uint32_t runtime_sink_blocks_ = 0;
     std::vector<KvMemBlock> blocks_;
     uint32_t total_tokens_ = 0;  // total appended context length
 };

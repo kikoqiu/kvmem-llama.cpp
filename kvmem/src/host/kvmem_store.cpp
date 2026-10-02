@@ -53,6 +53,24 @@ void KvMemStore::set_runtime_select_budget(uint32_t tokens) {
     runtime_select_budget_ = tokens;
 }
 
+void KvMemStore::set_runtime_sink_blocks(uint32_t blocks) {
+    // At or below the configured sink there is nothing to override: the base
+    // policy already covers it. Clearing also restores the base for the next
+    // request, so the protection stays per request.
+    if (blocks <= cfg_.sink_blocks) {
+        runtime_sink_blocks_ = 0;
+        return;
+    }
+    const uint32_t budget = budget_blocks();
+    if (budget != 0 && blocks > budget) {
+        std::fprintf(stderr,
+                     "KVMEM_TRACE protect_system_trim blocks=%u budget=%u\n",
+                     blocks, budget);
+        blocks = budget;
+    }
+    runtime_sink_blocks_ = blocks > cfg_.sink_blocks ? blocks : 0;
+}
+
 KvMemKeepAllocation resolve_kvmem_keep_allocation(
         uint32_t block_tokens,
         uint32_t select_budget,
@@ -401,7 +419,7 @@ std::vector<uint32_t> KvMemStore::constrain_media(std::vector<uint32_t> selected
         for (uint32_t i = lo[id]; i < hi[id]; ++i) kept[i] = true;
         count += need;
     };
-    for (uint32_t i = 0; i < std::min(n, cfg_.sink_blocks); ++i) keep(i, true);
+    for (uint32_t i = 0; i < std::min(n, sink_blocks()); ++i) keep(i, true);
     // Keep the latest image as a whole, including its boundary blocks.
     if (!groups.empty()) keep(groups.back().first, true);
     // Retrieval suffixes are best effort when they exceed the budget. Preserve
@@ -443,7 +461,7 @@ std::vector<uint32_t> KvMemStore::pick_prefill_ungrouped(
         return selected;
     }
 
-    const uint32_t sink = std::min({cfg_.sink_blocks, budget, n});
+    const uint32_t sink = std::min({sink_blocks(), budget, n});
     std::vector<uint8_t> kept(n, 0);
     uint32_t kept_count = 0;
     auto keep = [&](uint32_t id) {
@@ -512,7 +530,7 @@ std::vector<uint32_t> KvMemStore::pick_scored_ungrouped(
     }
 
     // Always-keep windows: first `sink_blocks` and last `recent_blocks`.
-    const uint32_t sink = std::min(cfg_.sink_blocks, n);
+    const uint32_t sink = std::min(sink_blocks(), n);
     // Zero is literal: do not reserve any suffix blocks.  Earlier versions used
     // zero as an implicit "auto = budget/4", which made a 200K-token budget
     // silently pin 50K tokens and was both surprising and hard to control.
@@ -668,7 +686,7 @@ std::vector<uint32_t> KvMemStore::pick_semantic_groups(
         }
     };
 
-    const uint32_t sink = std::min(cfg_.sink_blocks, n);
+    const uint32_t sink = std::min(sink_blocks(), n);
     const uint32_t recent = std::min(cfg_.recent_blocks, n);
     for (uint32_t id = 0; id < sink && kept_count < budget; ++id) keep(id);
     uint32_t mand_kept = 0;
