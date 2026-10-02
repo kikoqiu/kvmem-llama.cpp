@@ -3027,6 +3027,8 @@ int main(int argc, char ** argv) {
         next->query_max_tokens = st.query_max_tokens;
         next->query_replay_auto = st.query_replay_auto;
         next->query_policy_user = st.query_policy_user;
+        next->prefill_query_max_tokens = st.prefill_query_max_tokens;
+        next->protect_system = st.protect_system;
         next->model_name = st.model_name;
         next->cache_type_k = st.cache_type_k;
         next->cache_type_v = st.cache_type_v;
