@@ -308,15 +308,16 @@ kvmem_spec_gen_stats kvmem_spec_generate(
             n_draft_max = std::min(n_draft_max, n_predict - st.n_gen - 1);
             n_draft_max = std::max(n_draft_max, 0);
 
-            common_speculative_get_draft_params(spec, seq_id) = {
-                /* .drafting   = */ true,
-                /* .n_max      = */ n_draft_max,
-                /* .n_past     = */ n_past + position_offset,
-                /* .id_last    = */ id_last,
-                /* .prompt     = */ &prompt_tgt,
-                /* .result     = */ &draft,
-                /* .n_past_logical = */ n_past,
+            common_speculative_draft_params & dp = common_speculative_get_draft_params(spec, seq_id);
+            dp = {
+                /* .drafting = */ true,
+                /* .n_max    = */ n_draft_max,
+                /* .pos0     = */ n_past + position_offset,
+                /* .id_last  = */ id_last,
+                /* .prompt   = */ &prompt_tgt,
+                /* .result   = */ &draft,
             };
+            dp.n_past_logical = n_past;
             common_speculative_draft(spec);
 
             const bool host_ckpt = sess.use_ckpt_tgt
