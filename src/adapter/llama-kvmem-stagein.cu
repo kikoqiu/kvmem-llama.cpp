@@ -95,6 +95,13 @@ bool cuda_ok(cudaError_t e, const char * what) {
     if (e == cudaSuccess) {
         return true;
     }
+    if (e == cudaErrorMemoryAllocation) {
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        cudaMemGetInfo(&free_bytes, &total_bytes);
+        fprintf(stderr, "KVMEM stagein %s: %s free_bytes=%zu\n", what, cudaGetErrorString(e), free_bytes);
+        return false;
+    }
     fprintf(stderr, "KVMEM stagein %s: %s\n", what, cudaGetErrorString(e));
     return false;
 }
@@ -933,6 +940,7 @@ int kvmem_stageout_submit(int64_t * copy_us) {
                                     (size_t) nitem * sizeof(CopyOp),
                                     cudaMemcpyHostToDevice, stream()),
                     "gather ops H2D")) {
+            (void) cudaGetLastError();
             copy_bytes<<<nitem, 256, 0, stream()>>>(stage().dev_ops, nitem);
             packed = cuda_ok(cudaGetLastError(), "gather kernel");
             if (packed) {
@@ -1025,6 +1033,7 @@ bool kvmem_d2d_batched(const void * const * src, void * const * dst,
                  "layout ops H2D")) {
         return false;
     }
+    (void) cudaGetLastError();
     copy_bytes<<<n, 256, 0, stream()>>>(stage().dev_ops, n);
     const bool ok = cuda_ok(cudaGetLastError(), "layout copy kernel");
     if (ok) {

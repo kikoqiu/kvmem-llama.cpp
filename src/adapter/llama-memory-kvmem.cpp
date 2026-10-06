@@ -378,6 +378,21 @@ static bool kvmem_cuda_ok(cudaError_t e, const char * what) {
     return false;
 }
 
+// A handled OOM must not leak into the next CUDA call, and the caller needs the
+// size it asked for: report need/free, then clear the sticky error.
+static bool kvmem_cuda_malloc_ok(void ** ptr, size_t bytes, const char * phase) {
+    if (cudaMalloc(ptr, bytes) == cudaSuccess) {
+        return true;
+    }
+    (void) cudaGetLastError();
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    cudaMemGetInfo(&free_bytes, &total_bytes);
+    fprintf(stderr, "KVMEM D2H gpu staging: out of memory phase=%s need_bytes=%zu free_bytes=%zu\n",
+            phase, bytes, free_bytes);
+    return false;
+}
+
 static uint8_t * kvmem_cuda_tensor_ptr(ggml_tensor * t) {
     if (!t || !t->data) {
         return nullptr;
@@ -3133,7 +3148,7 @@ bool llama_memory_kvmem::d2h_grow(int slot, size_t bytes) {
     d2h_release(slot);
     uint8_t * gpu = nullptr;
     void * pin = nullptr;
-    if (!kvmem_cuda_ok(cudaMalloc(reinterpret_cast<void **>(&gpu), bytes), "gpu staging") ||
+    if (!kvmem_cuda_malloc_ok(reinterpret_cast<void **>(&gpu), bytes, "first") ||
         !kvmem_cuda_ok(cudaMallocHost(&pin, bytes), "pinned host")) {
         if (gpu) {
             cudaFree(gpu);
@@ -3147,7 +3162,7 @@ bool llama_memory_kvmem::d2h_grow(int slot, size_t bytes) {
             kvmem_diag("KVMEM_STAGING_TRIM slot=%d freed_bytes=%zu reason=grow_retry\n",
                        other, d2h_->slots[other].cap);
             d2h_release(other);
-            if (!kvmem_cuda_ok(cudaMalloc(reinterpret_cast<void **>(&gpu), bytes), "gpu staging") ||
+            if (!kvmem_cuda_malloc_ok(reinterpret_cast<void **>(&gpu), bytes, "retry") ||
                 !kvmem_cuda_ok(cudaMallocHost(&pin, bytes), "pinned host")) {
                 if (gpu) {
                     cudaFree(gpu);
